@@ -1,0 +1,21 @@
+# Binaries
+/bin/
+/out/
+*.exe
+
+# Local env / secrets
+.env
+*.pem
+*.key
+
+# Local-only development docs
+docs/
+AGENTS.md
+CLAUDE.md
+
+# Editor / agent tooling
+.idea/
+.vscode/
+.DS_Store
+.claude/
+.cursor/
