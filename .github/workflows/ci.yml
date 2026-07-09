@@ -1,0 +1,105 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.4-pg18-trixie
+        env:
+          POSTGRES_USER: timothy
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: timothy
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U timothy -d timothy"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -race ./...
+      - name: Integration test
+        env:
+          DATABASE_URL: postgres://timothy:ci@localhost:5432/timothy
+        run: go test -race -tags integration ./internal/platform/...
+      - name: Vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.12.2
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.18.0
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Build
+        run: npm run build
+      - name: Lint
+        run: npm run lint
+
+  images:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [brain, gateway, memoryd]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build image
+        run: >-
+          docker build -f deploy/Dockerfile
+          --build-arg SERVICE=${{ matrix.service }}
+          -t timothy-${{ matrix.service }}:ci .
+      - name: Scan image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: timothy-${{ matrix.service }}:ci
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+  # Umbrella gate with a stable name for branch rulesets: matrix legs
+  # report as "images (brain)" etc., which rulesets can't reference.
+  ci-ok:
+    runs-on: ubuntu-latest
+    needs: [go, lint, web, images]
+    if: always()
+    steps:
+      - name: All jobs green
+        run: |
+          [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "false" ]
