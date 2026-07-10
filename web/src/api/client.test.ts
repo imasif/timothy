@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { ChatError, chatStream, createSSEParser } from './client'
+import { ChatError, chatStream, createSSEParser, listSessions } from './client'
 import type { ChatEvent } from './types'
 
 afterEach(() => vi.unstubAllGlobals())
@@ -93,6 +93,32 @@ describe('chatStream errors', () => {
 
     expect(sessions).toEqual(['s-early'])
     expect(events).toEqual([{ type: 'done' }])
+  })
+
+  it('routes to the session messages endpoint when a session id is known', async () => {
+    vi.stubGlobal('localStorage', { getItem: () => 'tok', setItem: () => {} })
+    const fetchMock = vi.fn().mockResolvedValue(new Response('data: {"type":"done"}\n\n'))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await chatStream({ session_id: 's-42', message: 'hi' }, () => {})
+
+    expect(fetchMock.mock.calls[0][0]).toBe('/v1/sessions/s-42/messages')
+    // The id travels in the path, not the body.
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body as string)).toEqual({ message: 'hi' })
+  })
+
+  it('pages the session list with a composite cursor', async () => {
+    vi.stubGlobal('localStorage', { getItem: () => 'tok', setItem: () => {} })
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ sessions: [] }), { status: 200 }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    await listSessions('light', { before: '2026-07-10T12:00:00Z', beforeId: 's-42' })
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      '/v1/sessions?query=light&before=2026-07-10T12%3A00%3A00Z&before_id=s-42',
+    )
   })
 
   it('keeps raw text for non-json error bodies', async () => {

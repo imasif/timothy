@@ -45,6 +45,7 @@ func Register(srv *httpserver.Server, store ConfigSource, rec ledger.Recorder, l
 
 type streamRequest struct {
 	TaskCategory string             `json:"task_category"`
+	Purpose      string             `json:"purpose,omitempty"` // why: chat|distill|title|compaction|...
 	ModelHint    string             `json:"model_hint,omitempty"`
 	System       string             `json:"system,omitempty"`
 	Messages     []provider.Message `json:"messages"`
@@ -121,8 +122,8 @@ func (a *API) handleStream(w http.ResponseWriter, r *http.Request) {
 		res := streamAttempt(r.Context(), att, completion, ledger.Entry{
 			ID:       ledger.NewID(),
 			Provider: att.ProviderName, Model: att.Model,
-			TaskCategory: req.TaskCategory,
-			SessionID:    req.SessionID, LaneID: req.LaneID,
+			TaskCategory: req.TaskCategory, Purpose: req.Purpose,
+			SessionID: req.SessionID, LaneID: req.LaneID,
 		}, send)
 
 		if res.failedOver() {
@@ -307,9 +308,11 @@ func (a *API) handleProviders(w http.ResponseWriter, r *http.Request) {
 	rows, healthy := snap.Providers()
 	list := make([]map[string]any, 0, len(rows))
 	for _, row := range rows {
-		models := make([]string, 0, len(row.Models))
+		models := make([]map[string]any, 0, len(row.Models))
 		for _, m := range row.Models {
-			models = append(models, m.ID)
+			models = append(models, map[string]any{
+				"id": m.ID, "context_window": m.ContextWindow,
+			})
 		}
 		list = append(list, map[string]any{
 			"name":           row.Name,
