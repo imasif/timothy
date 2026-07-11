@@ -26,7 +26,9 @@ type StreamRequest struct {
 	ModelHint    string             `json:"model_hint,omitempty"`
 	System       string             `json:"system,omitempty"`
 	Messages     []provider.Message `json:"messages"`
+	Tools        []provider.ToolDef `json:"tools,omitempty"`
 	MaxTokens    int                `json:"max_tokens,omitempty"`
+	Effort       string             `json:"effort,omitempty"` // D-020: "low" | "" (normal)
 	SessionID    string             `json:"session_id,omitempty"`
 }
 
@@ -106,6 +108,39 @@ func (c *Client) ModelWindows(ctx context.Context) (map[string]int, error) {
 	c.windows, c.windowsExp = windows, time.Now().Add(windowsTTL)
 	c.mu.Unlock()
 	return windows, nil
+}
+
+// Embed returns one vector per input text via the gateway's
+// embedding route.
+func (c *Client) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+	body, err := json.Marshal(map[string]any{"texts": texts})
+	if err != nil {
+		return nil, fmt.Errorf("gwclient: marshal embed: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/embed", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("gwclient: request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("gwclient: gateway unreachable: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, fmt.Errorf("gwclient: gateway http %d: %s", resp.StatusCode, string(msg))
+	}
+	var out struct {
+		Embeddings [][]float32 `json:"embeddings"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("gwclient: decode embed: %w", err)
+	}
+	if len(out.Embeddings) != len(texts) {
+		return nil, fmt.Errorf("gwclient: embed returned %d vectors for %d texts", len(out.Embeddings), len(texts))
+	}
+	return out.Embeddings, nil
 }
 
 // Stream posts the request and yields the gateway's normalized events.
