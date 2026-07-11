@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/SumonMSelim/timothy/internal/brain/loop"
 	"github.com/SumonMSelim/timothy/internal/brain/memclient"
 	"github.com/SumonMSelim/timothy/internal/brain/session"
+	"github.com/SumonMSelim/timothy/internal/brain/settings"
 	"github.com/SumonMSelim/timothy/internal/brain/skills"
 	"github.com/SumonMSelim/timothy/internal/brain/tools"
 	"github.com/SumonMSelim/timothy/internal/brain/tools/builtin"
@@ -93,6 +95,7 @@ func main() {
 
 	gwc := gwclient.New(gatewayURL)
 	store := session.NewStore(app.DB)
+	flags := settings.New(app.DB, app.Log)
 	compactor := session.NewCompactor(store, gwc, gwc, budget, app.Log,
 		app.Metrics.NewCounter("session_compactions_total", "Sessions compacted to stay under the context budget."))
 	distill := func(ctx context.Context, sessionID, turnText string) *session.TurnMemory {
@@ -125,15 +128,21 @@ func main() {
 	}
 	mc := memclient.New(memorydURL)
 
-	agent, broker, outputs, buildErr := buildAgent(gwc, store, app.DB, workspace, packs, mc.Add, app.Log)
+	searxngURL := os.Getenv("SEARXNG_URL")
+
+	agent, broker, outputs, buildErr := buildAgent(gwc, store, app.DB, workspace, searxngURL, packs, mc.Add, app.Log)
 	if buildErr != nil {
 		fmt.Fprintln(os.Stderr, buildErr)
 		os.Exit(1)
 	}
 	go runOutputGC(ctx, outputs, app.Log)
 
-	svc := chat.New(turnRouter{agent: agent, gw: gwc}, store, distill, compactor, budget, skills.Index(packs), app.Log)
+	svc := chat.New(turnRouter{agent: agent, gw: gwc, flags: flags}, store, distill,
+		gatedCompactor{inner: compactor, flags: flags}, budget, skills.Index(packs), app.Log)
 	svc.SetMemoryExtract(func(ctx context.Context, sessionID string, seq int64, text string) {
+		if !flags.Enabled(ctx, settings.KeyMemoryExtraction) {
+			return
+		}
 		ectx, cancel := context.WithTimeout(context.WithoutCancel(ctx), extractBudget)
 		defer cancel()
 		if _, err := mc.Extract(ectx, sessionID, seq, text); err != nil {
@@ -141,6 +150,9 @@ func main() {
 		}
 	})
 	compactor.SetMemoryExtract(func(ctx context.Context, sessionID string, seq int64, text string) []string {
+		if !flags.Enabled(ctx, settings.KeyMemoryExtraction) {
+			return nil
+		}
 		// Own deadline WITHIN the compaction budget: extraction must
 		// never starve the summarize that follows it.
 		ectx, cancel := context.WithTimeout(ctx, preCompactExtractBudget)
@@ -163,7 +175,8 @@ func main() {
 		return memclient.RenderBlock(memories)
 	})
 
-	api.Register(app.Server, svc, store, broker, memoryProxy(memorydURL, app.Log), token, app.Log)
+	api.Register(app.Server, svc, store, broker,
+		memoryProxy(memorydURL, app.Log), adminProxy(gatewayURL, app.Log), flags, token, app.Log)
 
 	if err := app.Run(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		app.Log.Error("server exited", "error", err)
@@ -196,16 +209,55 @@ func memoryProxy(memorydURL string, log *slog.Logger) http.Handler {
 	}
 }
 
+// adminProxy forwards the browser's control-plane reads to the
+// gateway's internal API: /v1/admin/usage/* maps onto
+// /internal/usage/*. Brain adds only the bearer gate.
+func adminProxy(gatewayURL string, log *slog.Logger) http.Handler {
+	target, err := url.Parse(gatewayURL)
+	if err != nil {
+		log.Error("invalid GATEWAY_URL; admin routes disabled", "error", err)
+		return nil
+	}
+	return &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			r.SetURL(target)
+			r.Out.URL.Path = "/internal/admin/" + strings.TrimPrefix(r.In.URL.Path, "/v1/admin/")
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Warn("gateway admin proxy error", "path", r.URL.Path, "error", err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"error":{"code":"gateway_unreachable","message":"gateway unavailable"}}`))
+		},
+	}
+}
+
+// gatedCompactor honors the compaction feature switch: off means
+// sessions simply grow until it is flipped back on.
+type gatedCompactor struct {
+	inner chat.Compactor
+	flags *settings.Store
+}
+
+func (g gatedCompactor) MaybeCompact(ctx context.Context, sessionID string) error {
+	if !g.flags.Enabled(ctx, settings.KeyCompaction) {
+		return nil
+	}
+	return g.inner.MaybeCompact(ctx, sessionID)
+}
+
 // turnRouter sends chat turns through the agent loop and everything
 // else (titles, distills, compaction summaries) straight to the
-// gateway.
+// gateway. With the tools switch off, chat turns bypass the agent
+// loop entirely — plain pass-through completion.
 type turnRouter struct {
 	agent *loop.Agent
 	gw    chat.Gateway
+	flags *settings.Store
 }
 
 func (r turnRouter) Stream(ctx context.Context, req gwclient.StreamRequest) (<-chan stream.StreamEvent, error) {
-	if req.Purpose != "chat" {
+	if req.Purpose != "chat" || !r.flags.Enabled(ctx, settings.KeyTools) {
 		return r.gw.Stream(ctx, req)
 	}
 	return r.agent.Start(ctx, loop.Request{
@@ -219,7 +271,7 @@ func (r turnRouter) Stream(ctx context.Context, req gwclient.StreamRequest) (<-c
 
 // buildAgent assembles the compiled-in tool registry and its guard
 // rails (D-009, D-010).
-func buildAgent(gwc *gwclient.Client, store *session.Store, db *pgpool.Pool, workspace string, packs []skills.Skill, remember builtin.RememberFunc, log *slog.Logger) (*loop.Agent, *loop.PermBroker, *tools.Outputs, error) {
+func buildAgent(gwc *gwclient.Client, store *session.Store, db *pgpool.Pool, workspace, searxngURL string, packs []skills.Skill, remember builtin.RememberFunc, log *slog.Logger) (*loop.Agent, *loop.PermBroker, *tools.Outputs, error) {
 	outputs := tools.NewOutputs(db)
 	reg := tools.NewRegistry()
 	set := []*tools.Tool{
@@ -230,6 +282,11 @@ func buildAgent(gwc *gwclient.Client, store *session.Store, db *pgpool.Pool, wor
 		builtin.Shell(builtin.ShellConfig{WorkspaceRoot: workspace}),
 		builtin.RetrieveOutput(outputs),
 		builtin.Remember(remember),
+	}
+	// Search is optional infra: only registered when a backend is
+	// configured, so an environment without SearXNG still runs clean.
+	if searxngURL != "" {
+		set = append(set, builtin.WebSearch(searxngURL))
 	}
 	if len(packs) > 0 {
 		set = append(set, skills.LoadSkillTool(packs))
