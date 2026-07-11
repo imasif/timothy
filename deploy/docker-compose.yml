@@ -52,6 +52,10 @@ services:
       <<: *db-env
       PORT: "8080"
       GATEWAY_URL: http://gateway:8081
+      MEMORYD_URL: http://memoryd:8082
+      # Optional projected-context budget override (tokens); empty
+      # uses the built-in default. Handy for compaction testing.
+      SESSION_TOKEN_BUDGET: ${SESSION_TOKEN_BUDGET:-}
       # Brain-only secret: the public API bearer token.
       TIMOTHY_API_TOKEN: ${TIMOTHY_API_TOKEN:-}
       # Where the shell tool runs; the only tree tools may touch.
@@ -94,6 +98,7 @@ services:
     environment:
       <<: *db-env
       PORT: "8082"
+      GATEWAY_URL: http://gateway:8081
     # internal-only: no published ports
 
   web:

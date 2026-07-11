@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -18,6 +20,7 @@ import (
 	"github.com/SumonMSelim/timothy/internal/brain/chat"
 	"github.com/SumonMSelim/timothy/internal/brain/gwclient"
 	"github.com/SumonMSelim/timothy/internal/brain/loop"
+	"github.com/SumonMSelim/timothy/internal/brain/memclient"
 	"github.com/SumonMSelim/timothy/internal/brain/session"
 	"github.com/SumonMSelim/timothy/internal/brain/skills"
 	"github.com/SumonMSelim/timothy/internal/brain/tools"
@@ -37,6 +40,16 @@ const defaultTokenBudget = 60_000
 const (
 	serviceName = "brain"
 	defaultPort = 8080
+	// extractBudget bounds the fire-and-forget turn-end extraction:
+	// one memoryd round trip (LLM + embed) plus slack.
+	extractBudget = 90 * time.Second
+	// retrieveBudget sits ON the turn's critical path — one embed +
+	// three SQL legs, so tight.
+	retrieveBudget = 10 * time.Second
+	// preCompactExtractBudget bounds the extraction INSIDE the
+	// compaction pass so a slow extraction degrades to empty facts
+	// instead of starving the summarize.
+	preCompactExtractBudget = 45 * time.Second
 )
 
 func main() {
@@ -106,7 +119,13 @@ func main() {
 		return httpserver.Check{Status: "ok"}
 	})
 
-	agent, broker, outputs, buildErr := buildAgent(gwc, store, app.DB, workspace, packs, app.Log)
+	memorydURL := os.Getenv("MEMORYD_URL")
+	if memorydURL == "" {
+		memorydURL = "http://memoryd:8082"
+	}
+	mc := memclient.New(memorydURL)
+
+	agent, broker, outputs, buildErr := buildAgent(gwc, store, app.DB, workspace, packs, mc.Add, app.Log)
 	if buildErr != nil {
 		fmt.Fprintln(os.Stderr, buildErr)
 		os.Exit(1)
@@ -114,11 +133,66 @@ func main() {
 	go runOutputGC(ctx, outputs, app.Log)
 
 	svc := chat.New(turnRouter{agent: agent, gw: gwc}, store, distill, compactor, budget, skills.Index(packs), app.Log)
-	api.Register(app.Server, svc, store, broker, token, app.Log)
+	svc.SetMemoryExtract(func(ctx context.Context, sessionID string, seq int64, text string) {
+		ectx, cancel := context.WithTimeout(context.WithoutCancel(ctx), extractBudget)
+		defer cancel()
+		if _, err := mc.Extract(ectx, sessionID, seq, text); err != nil {
+			app.Log.Warn("turn memory extraction failed", "session_id", sessionID, "error", err)
+		}
+	})
+	compactor.SetMemoryExtract(func(ctx context.Context, sessionID string, seq int64, text string) []string {
+		// Own deadline WITHIN the compaction budget: extraction must
+		// never starve the summarize that follows it.
+		ectx, cancel := context.WithTimeout(ctx, preCompactExtractBudget)
+		defer cancel()
+		ids, err := mc.Extract(ectx, sessionID, seq, text)
+		if err != nil {
+			app.Log.Warn("pre-compaction extraction failed", "session_id", sessionID, "error", err)
+			return nil
+		}
+		return ids
+	})
+	svc.SetMemoryRetrieve(func(ctx context.Context, sessionID, query string) string {
+		rctx, cancel := context.WithTimeout(ctx, retrieveBudget)
+		defer cancel()
+		memories, err := mc.Retrieve(rctx, sessionID, query)
+		if err != nil {
+			app.Log.Warn("memory retrieval failed; turn continues without", "session_id", sessionID, "error", err)
+			return ""
+		}
+		return memclient.RenderBlock(memories)
+	})
+
+	api.Register(app.Server, svc, store, broker, memoryProxy(memorydURL, app.Log), token, app.Log)
 
 	if err := app.Run(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		app.Log.Error("server exited", "error", err)
 		os.Exit(1)
+	}
+}
+
+// memoryProxy forwards the web's memory-management routes to memoryd
+// verbatim — brain adds only the bearer gate. The search route maps
+// onto memoryd's retrieve endpoint.
+func memoryProxy(memorydURL string, log *slog.Logger) http.Handler {
+	target, err := url.Parse(memorydURL)
+	if err != nil {
+		log.Error("invalid MEMORYD_URL; memory routes disabled", "error", err)
+		return nil
+	}
+	return &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			r.SetURL(target)
+			if r.In.URL.Path == "/v1/memories/search" {
+				r.Out.URL.Path = "/v1/retrieve"
+			}
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Warn("memoryd proxy error", "path", r.URL.Path, "error", err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"error":{"code":"memoryd_unreachable","message":"memory service unavailable"}}`))
+		},
 	}
 }
 
@@ -145,7 +219,7 @@ func (r turnRouter) Stream(ctx context.Context, req gwclient.StreamRequest) (<-c
 
 // buildAgent assembles the compiled-in tool registry and its guard
 // rails (D-009, D-010).
-func buildAgent(gwc *gwclient.Client, store *session.Store, db *pgpool.Pool, workspace string, packs []skills.Skill, log *slog.Logger) (*loop.Agent, *loop.PermBroker, *tools.Outputs, error) {
+func buildAgent(gwc *gwclient.Client, store *session.Store, db *pgpool.Pool, workspace string, packs []skills.Skill, remember builtin.RememberFunc, log *slog.Logger) (*loop.Agent, *loop.PermBroker, *tools.Outputs, error) {
 	outputs := tools.NewOutputs(db)
 	reg := tools.NewRegistry()
 	set := []*tools.Tool{
@@ -155,6 +229,7 @@ func buildAgent(gwc *gwclient.Client, store *session.Store, db *pgpool.Pool, wor
 		builtin.WebFetch(),
 		builtin.Shell(builtin.ShellConfig{WorkspaceRoot: workspace}),
 		builtin.RetrieveOutput(outputs),
+		builtin.Remember(remember),
 	}
 	if len(packs) > 0 {
 		set = append(set, skills.LoadSkillTool(packs))

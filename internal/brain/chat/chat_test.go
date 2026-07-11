@@ -498,3 +498,165 @@ func TestFollowUpSeesCompletedTurnWhileDistillRuns(t *testing.T) {
 		t.Fatalf("phantom interruption in follow-up context: %s", msgs)
 	}
 }
+
+func TestMemoryExtractGetsUserTextAndResidue(t *testing.T) {
+	t.Parallel()
+	log := newFakeLog()
+	gw := &fakeGW{events: okEvents("the answer")}
+	distill := func(context.Context, string, string) *session.TurnMemory {
+		return &session.TurnMemory{KeyFindings: []string{"user moved to Porto"}}
+	}
+	svc := New(gw, log, distill, nil, 60_000, "", discard())
+
+	type call struct {
+		sessionID string
+		seq       int64
+		text      string
+	}
+	got := make(chan call, 1)
+	svc.SetMemoryExtract(func(_ context.Context, sessionID string, seq int64, text string) {
+		got <- call{sessionID, seq, text}
+	})
+
+	_, ch, err := svc.Chat(t.Context(), Request{SessionID: "s1", Message: "I moved to Porto"})
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	drain(t, ch)
+
+	select {
+	case c := <-got:
+		if c.sessionID != "s1" || c.seq == 0 {
+			t.Fatalf("call = %+v", c)
+		}
+		if !strings.Contains(c.text, "I moved to Porto") {
+			t.Fatalf("user text missing: %q", c.text)
+		}
+		if !strings.Contains(c.text, "user moved to Porto") {
+			t.Fatalf("residue missing: %q", c.text)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("memory extract never invoked")
+	}
+}
+
+func TestMemoryExtractWithoutDistillSendsAssistantText(t *testing.T) {
+	t.Parallel()
+	log := newFakeLog()
+	gw := &fakeGW{events: okEvents("the answer")}
+	svc := newService(gw, log) // no distiller
+
+	got := make(chan string, 1)
+	svc.SetMemoryExtract(func(_ context.Context, _ string, _ int64, text string) {
+		got <- text
+	})
+
+	_, ch, err := svc.Chat(t.Context(), Request{SessionID: "s1", Message: "question"})
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	drain(t, ch)
+
+	select {
+	case text := <-got:
+		if !strings.Contains(text, "question") || !strings.Contains(text, "the answer") {
+			t.Fatalf("text = %q, want user + assistant", text)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("memory extract never invoked")
+	}
+}
+
+func TestMemoryRetrieveInjectsIntoSystemTail(t *testing.T) {
+	t.Parallel()
+	log := newFakeLog()
+	gw := &fakeGW{events: okEvents("answer")}
+	svc := newService(gw, log)
+	block := "<memory source=\"timothy-memory\" trust=\"data\">\n- [semantic] user lives in Porto\n</memory>"
+	svc.SetMemoryRetrieve(func(_ context.Context, sessionID, query string) string {
+		if sessionID != "s1" || !strings.Contains(query, "where do I live") {
+			t.Errorf("retrieve got sessionID=%s query=%q", sessionID, query)
+		}
+		return block
+	})
+
+	_, ch, err := svc.Chat(t.Context(), Request{SessionID: "s1", Message: "where do I live?"})
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	drain(t, ch)
+
+	sent := chatRequest(t, gw)
+	if !strings.HasSuffix(sent.System, block) {
+		t.Fatalf("memory block not at system tail:\n%s", sent.System)
+	}
+	// The stable prefix stays byte-identical (D-018).
+	base := newService(gw, log)
+	if !strings.HasPrefix(sent.System, base.system) {
+		t.Fatal("system prefix changed by memory injection")
+	}
+}
+
+// chatRequest returns the turn's actual chat call (auto-title fires a
+// second, purposeless mini request on first exchanges).
+func chatRequest(t *testing.T, gw *fakeGW) gwclient.StreamRequest {
+	t.Helper()
+	gw.mu.Lock()
+	defer gw.mu.Unlock()
+	for _, r := range gw.requests {
+		if r.Purpose == "chat" {
+			return r
+		}
+	}
+	t.Fatal("no chat request recorded")
+	return gwclient.StreamRequest{}
+}
+
+func TestMemoryRetrieveEmptyLeavesSystemUntouched(t *testing.T) {
+	t.Parallel()
+	log := newFakeLog()
+	gw := &fakeGW{events: okEvents("answer")}
+	svc := newService(gw, log)
+	svc.SetMemoryRetrieve(func(context.Context, string, string) string { return "" })
+
+	_, ch, err := svc.Chat(t.Context(), Request{SessionID: "s1", Message: "hello"})
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	drain(t, ch)
+
+	got := chatRequest(t, gw).System
+	if got != svc.system {
+		t.Fatalf("system modified on empty recall:\n%q\nvs\n%q", got, svc.system)
+	}
+}
+
+func TestMemoryExtractFiresOnTextlessTurn(t *testing.T) {
+	t.Parallel()
+	log := newFakeLog()
+	// Provider quirk: turn completes with reasoning/tool traffic but
+	// no text. The user's words still carry facts.
+	gw := &fakeGW{events: []stream.StreamEvent{
+		{Type: stream.EventDone, Meta: &stream.Meta{Provider: "prov", Model: "mod"}},
+	}}
+	svc := newService(gw, log)
+	got := make(chan string, 1)
+	svc.SetMemoryExtract(func(_ context.Context, _ string, _ int64, text string) {
+		got <- text
+	})
+
+	_, ch, err := svc.Chat(t.Context(), Request{SessionID: "s1", Message: "I moved to Porto in June 2026"})
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	drain(t, ch)
+
+	select {
+	case text := <-got:
+		if !strings.Contains(text, "I moved to Porto") {
+			t.Fatalf("text = %q", text)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("memory extract skipped on textless turn")
+	}
+}
