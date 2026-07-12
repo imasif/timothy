@@ -326,12 +326,24 @@ func (s *Service) persistTurn(sessionID, userText, category string, firstExchang
 		return
 	}
 
+	// Models occasionally restate their entire answer after a late
+	// tool call; the loop concatenates every step's text, so the
+	// restatement lands as a verbatim duplicate tail. Collapse it
+	// before the turn becomes durable.
+	text = collapseRepeatedTail(text)
+	reasoning = collapseRepeatedTail(reasoning)
+
 	var turn session.AssistantTurn
 	turn.LLM.Message = text
 	if reasoning != "" {
 		turn.UI.Blocks = append(turn.UI.Blocks, session.UIBlock{Type: "reasoning", Text: reasoning})
 	}
-	turn.UI.Blocks = append(turn.UI.Blocks, session.UIBlock{Type: "text", Text: text})
+	// A turn whose answer landed entirely in reasoning has no text;
+	// an empty text block serializes without its text key (omitempty)
+	// and renders as a literal "undefined" in older clients.
+	if text != "" {
+		turn.UI.Blocks = append(turn.UI.Blocks, session.UIBlock{Type: "text", Text: text})
+	}
 	if meta != nil {
 		turn.Provider, turn.Model, turn.LedgerID = meta.Provider, meta.Model, meta.LedgerID
 	}
@@ -451,6 +463,29 @@ func truncateRunes(s string, n int) string {
 		return s
 	}
 	return string(runes[:n])
+}
+
+// collapseRepeatedTail strips a verbatim duplicated tail: when the
+// text ends with a block that is an exact copy of what immediately
+// precedes it (whitespace between copies aside), one copy is dropped.
+// The 40-char floor keeps legitimately repeated short phrases intact;
+// scanning longest-first collapses the whole restated answer, not a
+// fragment of it.
+func collapseRepeatedTail(s string) string {
+	const minRepeat = 40
+	t := strings.TrimRight(s, " \t\n")
+	n := len(t)
+	for l := n / 2; l >= minRepeat; l-- {
+		tail := t[n-l:]
+		head := strings.TrimRight(t[:n-l], " \t\n")
+		if strings.HasSuffix(head, tail) {
+			return collapseRepeatedTail(head)
+		}
+	}
+	if n == len(s) {
+		return s
+	}
+	return t
 }
 
 func hasUserMessage(events []session.Event) bool {

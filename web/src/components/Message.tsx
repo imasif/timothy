@@ -3,8 +3,9 @@ import { HugeiconsIcon } from '@hugeicons/react'
 import { useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import rehypeHighlight from 'rehype-highlight'
+import remarkGfm from 'remark-gfm'
 import { Badge } from './ui/badge'
-import { splitSources } from '../lib/citations'
+import { collapseRepeatedTail, splitSources } from '../lib/citations'
 import type { AssistantState, ToolRun } from '../lib/chat'
 import 'highlight.js/styles/github-dark.css'
 
@@ -97,7 +98,7 @@ export function InterruptedMessage({ text }: { text: string }) {
   return (
     <div className="group/message flex flex-col items-start gap-2" data-testid="interrupted">
       <div className="prose prose-sm max-w-3xl dark:prose-invert prose-pre:bg-zinc-900">
-        <ReactMarkdown rehypePlugins={[rehypeHighlight]}>{text}</ReactMarkdown>
+        <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>{text}</ReactMarkdown>
       </div>
       <div className="flex items-center gap-1.5">
         <Badge
@@ -165,7 +166,9 @@ export function AssistantMessage({ msg }: { msg: AssistantState }) {
   // Citations only split out once the answer is done streaming: a
   // partial "## Sources" heading mid-stream would otherwise flicker
   // the body text as more of it arrives.
-  const { body, citations } = msg.streaming ? { body: msg.text, citations: [] } : splitSources(msg.text)
+  const { body, citations } = msg.streaming
+    ? { body: msg.text, citations: [] }
+    : splitSources(collapseRepeatedTail(msg.text))
   return (
     <div className="group/message flex flex-col items-start gap-2">
       {msg.reasoning !== '' && (
@@ -190,7 +193,7 @@ export function AssistantMessage({ msg }: { msg: AssistantState }) {
       )}
 
       <div className="prose prose-sm max-w-3xl dark:prose-invert prose-pre:bg-zinc-900">
-        <ReactMarkdown rehypePlugins={[rehypeHighlight]}>{body}</ReactMarkdown>
+        <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>{body}</ReactMarkdown>
         {msg.streaming && msg.permissions.length === 0 && <span className="animate-pulse">▍</span>}
       </div>
 
