@@ -18,9 +18,18 @@ var adminRoutePatterns = []string{
 	"PATCH /v1/admin/providers/{id}",
 	"DELETE /v1/admin/providers/{id}",
 	"POST /v1/admin/providers/{id}/test",
+	"GET /v1/admin/providers/{id}/models",
+	"POST /v1/admin/providers/validate",
 	"GET /v1/admin/providers/health",
 	"GET /v1/admin/routes",
 	"PATCH /v1/admin/routes/{category}",
+	"PUT /v1/admin/secrets/{ref_name}",
+	"DELETE /v1/admin/secrets/{ref_name}",
+	"GET /v1/admin/secrets/{ref_name}",
+	"GET /v1/admin/secret-backends/{backend}",
+	"PUT /v1/admin/secret-backends/{backend}",
+	"DELETE /v1/admin/secret-backends/{backend}",
+	"POST /v1/admin/secret-backends/{backend}/test",
 }
 
 // registerAdmin mounts the admin proxy behind bearer auth. nil leaves

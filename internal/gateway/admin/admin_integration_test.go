@@ -4,6 +4,7 @@ package admin
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"github.com/SumonMSelim/timothy/internal/gateway/router"
 	"github.com/SumonMSelim/timothy/internal/platform/migrate"
 	"github.com/SumonMSelim/timothy/internal/platform/pgpool"
+	"github.com/SumonMSelim/timothy/internal/secretstore"
 	"github.com/SumonMSelim/timothy/migrations"
 )
 
@@ -40,22 +42,34 @@ func testAdmin(t *testing.T) (*Admin, *router.Store, *pgpool.Pool) {
 	if err := migrate.Run(ctx, db, migrations.FS, log); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	t.Cleanup(func() {
-		_, _ = db.Exec(context.Background(),
+	// Sweep runs at setup AND teardown: a killed run never executes
+	// cleanups, and its leftovers would fail every later run (unique
+	// name collisions, accumulated audit rows).
+	sweep := func(ctx context.Context) {
+		_, _ = db.Exec(ctx,
 			"DELETE FROM task_routes WHERE task_category LIKE $1 || '%'", adminMarker)
-		_, _ = db.Exec(context.Background(),
+		_, _ = db.Exec(ctx,
 			"DELETE FROM providers WHERE name LIKE $1 || '%'", adminMarker)
-		_, _ = db.Exec(context.Background(),
-			"DELETE FROM admin_audit WHERE entity_id LIKE $1 || '%' OR after::text LIKE '%' || $1 || '%'", adminMarker)
-		_, _ = db.Exec(context.Background(),
+		_, _ = db.Exec(ctx,
+			"DELETE FROM admin_audit WHERE entity = 'budget' OR entity_id LIKE $1 || '%' OR after::text LIKE '%' || $1 || '%'", adminMarker)
+		_, _ = db.Exec(ctx,
 			"DELETE FROM cost_ledger WHERE provider LIKE $1 || '%'", adminMarker)
-	})
+		_, _ = db.Exec(ctx, "DELETE FROM spend_budgets")
+		_, _ = db.Exec(ctx, "DELETE FROM secrets WHERE ref_name LIKE $1 || '%'", adminMarker)
+	}
+	sweep(ctx)
+	t.Cleanup(func() { sweep(context.Background()) })
 
 	store := router.NewStore(pool, func(string) string { return "resolved" }, log)
 	if err := store.Load(ctx); err != nil {
 		t.Fatalf("store load: %v", err)
 	}
-	return New(pool, store, ledger.New(pool, log), ledger.NewBudgetStore(pool), log), store, pool
+	masterKey := make([]byte, 32)
+	secrets, err := secretstore.New(pool, masterKey)
+	if err != nil {
+		t.Fatalf("secretstore.New: %v", err)
+	}
+	return New(pool, store, ledger.New(pool, log), ledger.NewBudgetStore(pool), secrets, log), store, pool
 }
 
 func TestProviderCRUDAuditsAndReloads(t *testing.T) {
@@ -285,5 +299,86 @@ func TestPatchBudgetValidatesAndAudits(t *testing.T) {
 	}
 	if audits != 1 {
 		t.Fatalf("audit rows = %d, want 1", audits)
+	}
+}
+
+func TestSecretSetDeleteAuditsAndReloads(t *testing.T) {
+	adm, store, pool := testAdmin(t)
+	ctx := t.Context()
+	db, _ := pool.Get()
+	ref := adminMarker + "secret"
+
+	if configured, _, err := adm.SecretStatus(ctx, ref); err != nil || configured {
+		t.Fatalf("SecretStatus before Set: configured=%v err=%v", configured, err)
+	}
+
+	before := store.Snapshot()
+	if err := adm.SetSecret(ctx, ref, "sk-live-value"); err != nil {
+		t.Fatalf("SetSecret: %v", err)
+	}
+	if configured, backend, err := adm.SecretStatus(ctx, ref); err != nil || !configured || backend != "db" {
+		t.Fatalf("SecretStatus after Set: configured=%v backend=%q err=%v", configured, backend, err)
+	}
+	if store.Snapshot() == before {
+		t.Fatal("SetSecret did not trigger a snapshot reload")
+	}
+
+	var audits int
+	if err := db.QueryRow(ctx, `SELECT count(*) FROM admin_audit
+		WHERE entity = 'secret' AND entity_id = $1 AND action = 'set'`, ref).Scan(&audits); err != nil {
+		t.Fatalf("audit query: %v", err)
+	}
+	if audits != 1 {
+		t.Fatalf("audit rows = %d, want 1", audits)
+	}
+
+	if err := adm.DeleteSecret(ctx, ref); err != nil {
+		t.Fatalf("DeleteSecret: %v", err)
+	}
+	if configured, _, err := adm.SecretStatus(ctx, ref); err != nil || configured {
+		t.Fatalf("SecretStatus after Delete: configured=%v err=%v", configured, err)
+	}
+}
+
+func TestSecretExternalBackendConfig(t *testing.T) {
+	adm, _, pool := testAdmin(t)
+	ctx := t.Context()
+	db, _ := pool.Get()
+	ref := adminMarker + "vault-secret"
+
+	if err := adm.SetSecretBackendConfig(ctx, "vault",
+		[]byte(`{"address":"http://vault:8200","mount":"kv"}`)); err != nil {
+		t.Fatalf("SetSecretBackendConfig: %v", err)
+	}
+	t.Cleanup(func() {
+		db.Exec(ctx, `DELETE FROM secret_backend_config WHERE backend = 'vault'`)
+	})
+	raw, err := adm.SecretBackendConfig(ctx, "vault")
+	if err != nil {
+		t.Fatalf("SecretBackendConfig: %v", err)
+	}
+	var cfg map[string]string
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("config %s: %v", raw, err)
+	}
+	want := map[string]string{"address": "http://vault:8200", "mount": "kv", "token_ref": "VAULT_TOKEN"}
+	for k, v := range want {
+		if cfg[k] != v {
+			t.Errorf("config[%s] = %q, want %q", k, cfg[k], v)
+		}
+	}
+
+	if err := adm.SetSecretExternal(ctx, ref, "vault", "timothy/anthropic#api_key"); err != nil {
+		t.Fatalf("SetSecretExternal: %v", err)
+	}
+	if configured, backend, err := adm.SecretStatus(ctx, ref); err != nil || !configured || backend != "vault" {
+		t.Fatalf("SecretStatus: configured=%v backend=%q err=%v", configured, backend, err)
+	}
+
+	if err := adm.SetSecretExternal(ctx, ref, "db", "x"); err == nil {
+		t.Fatal("SetSecretExternal with backend db: want error")
+	}
+	if err := adm.SetSecretExternal(ctx, ref, "vault", ""); err == nil {
+		t.Fatal("SetSecretExternal without backend_ref: want error")
 	}
 }

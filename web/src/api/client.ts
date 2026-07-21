@@ -1,6 +1,7 @@
 import type {
   AdminProvider,
   AdminRoute,
+  AvailableModel,
   BudgetStatus,
   CacheRow,
   ChainEntry,
@@ -355,11 +356,103 @@ export async function testProvider(id: string, model?: string): Promise<TestResu
   })
 }
 
+// validateProvider probes an UNSAVED provider config with a one-token
+// completion — the add dialog's validate-on-create. Probe failures come
+// back as { ok: false, detail }; only invalid configs throw.
+export async function validateProvider(
+  p: Partial<AdminProvider>,
+  model: string,
+): Promise<TestResult> {
+  return request<TestResult>('/v1/admin/providers/validate', {
+    method: 'POST',
+    body: JSON.stringify({ ...p, model }),
+  })
+}
+
+// availableModels proxies the provider's own model-listing endpoint.
+// Throws ChatError with status 422 when the driver cannot list models
+// (bedrock) — callers fall back to manual entry.
+export async function availableModels(id: string): Promise<AvailableModel[]> {
+  const { models } = await request<{ models: AvailableModel[] }>(
+    `/v1/admin/providers/${id}/models`,
+  )
+  return models ?? []
+}
+
 export async function providersHealth(): Promise<ProviderHealth[]> {
   const { providers } = await request<{ providers: ProviderHealth[] }>(
     '/v1/admin/providers/health',
   )
   return providers ?? []
+}
+
+// setSecret stores a credential value under refName (write-only: it is
+// never returned by any endpoint). deleteSecret removes it; the
+// provider then builds without a key and shows unhealthy until a new
+// value is set.
+export async function setSecret(refName: string, value: string): Promise<void> {
+  await request<void>(`/v1/admin/secrets/${encodeURIComponent(refName)}`, {
+    method: 'PUT',
+    body: JSON.stringify({ value }),
+  })
+}
+
+// setSecretExternal points refName at a secret held in Vault or AWS
+// Secrets Manager instead of storing a value here.
+export async function setSecretExternal(
+  refName: string,
+  backend: 'vault' | 'asm',
+  backendRef: string,
+): Promise<void> {
+  await request<void>(`/v1/admin/secrets/${encodeURIComponent(refName)}`, {
+    method: 'PUT',
+    body: JSON.stringify({ backend, backend_ref: backendRef }),
+  })
+}
+
+export async function deleteSecret(refName: string): Promise<void> {
+  await request<void>(`/v1/admin/secrets/${encodeURIComponent(refName)}`, { method: 'DELETE' })
+}
+
+export interface SecretStatus {
+  configured: boolean
+  backend: string
+}
+
+export async function secretStatus(refName: string): Promise<SecretStatus> {
+  if (!refName) return { configured: false, backend: '' }
+  return request<SecretStatus>(`/v1/admin/secrets/${encodeURIComponent(refName)}`)
+}
+
+export async function getSecretBackendConfig(
+  backend: 'vault' | 'asm',
+): Promise<Record<string, string>> {
+  const { config } = await request<{ config: Record<string, string> }>(
+    `/v1/admin/secret-backends/${backend}`,
+  )
+  return config ?? {}
+}
+
+export async function putSecretBackendConfig(
+  backend: 'vault' | 'asm',
+  config: Record<string, string>,
+): Promise<void> {
+  await request<void>(`/v1/admin/secret-backends/${backend}`, {
+    method: 'PUT',
+    body: JSON.stringify({ config }),
+  })
+}
+
+export async function deleteSecretBackendConfig(backend: 'vault' | 'asm'): Promise<void> {
+  await request<void>(`/v1/admin/secret-backends/${backend}`, { method: 'DELETE' })
+}
+
+export async function testSecretBackend(
+  backend: 'vault' | 'asm',
+): Promise<{ ok: boolean; error?: string }> {
+  return request<{ ok: boolean; error?: string }>(`/v1/admin/secret-backends/${backend}/test`, {
+    method: 'POST',
+  })
 }
 
 export async function listRoutes(): Promise<AdminRoute[]> {

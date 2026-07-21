@@ -19,6 +19,7 @@ import (
 	"github.com/SumonMSelim/timothy/internal/gateway/router"
 	"github.com/SumonMSelim/timothy/internal/gateway/stream"
 	"github.com/SumonMSelim/timothy/internal/platform/pgpool"
+	"github.com/SumonMSelim/timothy/internal/secretstore"
 )
 
 // pgxQuerier is satisfied by both *pgxpool.Pool and pgx.Tx: scanProvider
@@ -46,11 +47,106 @@ type Admin struct {
 	store   *router.Store
 	rec     ledger.Recorder
 	budgets *ledger.BudgetStore
+	secrets *secretstore.Store
 	log     *slog.Logger
 }
 
-func New(db *pgpool.Pool, store *router.Store, rec ledger.Recorder, budgets *ledger.BudgetStore, log *slog.Logger) *Admin {
-	return &Admin{db: db, store: store, rec: rec, budgets: budgets, log: log}
+func New(db *pgpool.Pool, store *router.Store, rec ledger.Recorder, budgets *ledger.BudgetStore, secrets *secretstore.Store, log *slog.Logger) *Admin {
+	return &Admin{db: db, store: store, rec: rec, budgets: budgets, secrets: secrets, log: log}
+}
+
+// SetSecret stores value under refName (write-only: the value is never
+// read back through any admin endpoint) and reloads the serving
+// snapshot so a provider whose credential_ref matches starts resolving
+// immediately.
+func (a *Admin) SetSecret(ctx context.Context, refName, value string) error {
+	if refName == "" {
+		return fmt.Errorf("ref name is required")
+	}
+	if value == "" {
+		return fmt.Errorf("value is required")
+	}
+	if err := a.secrets.Set(ctx, refName, value); err != nil {
+		return err
+	}
+	a.audit(ctx, "set", "secret", refName, nil, map[string]bool{"configured": true})
+	a.reload(ctx)
+	return nil
+}
+
+// DeleteSecret removes a stored secret value.
+func (a *Admin) DeleteSecret(ctx context.Context, refName string) error {
+	if err := a.secrets.Delete(ctx, refName); err != nil {
+		return err
+	}
+	a.audit(ctx, "delete", "secret", refName, map[string]bool{"configured": true}, nil)
+	a.reload(ctx)
+	return nil
+}
+
+// SetSecretExternal points refName at a secret held in an external
+// backend (vault, asm) instead of storing a value. backendRef is the
+// path/name in that system.
+func (a *Admin) SetSecretExternal(ctx context.Context, refName, backend, backendRef string) error {
+	if refName == "" {
+		return fmt.Errorf("ref name is required")
+	}
+	if err := a.secrets.SetExternal(ctx, refName, backend, backendRef); err != nil {
+		return err
+	}
+	a.audit(ctx, "set", "secret", refName, nil, map[string]string{"backend": backend})
+	a.reload(ctx)
+	return nil
+}
+
+// SecretStatus reports whether refName has a stored secret and which
+// backend serves it, without exposing the value — used to render the
+// "configured" badge in the UI.
+func (a *Admin) SecretStatus(ctx context.Context, refName string) (configured bool, backend string, err error) {
+	if refName == "" {
+		return false, "", nil
+	}
+	return a.secrets.Status(ctx, refName)
+}
+
+// SecretBackendConfig returns a backend's stored connection config
+// (never a credential — the vault token lives in the secret store).
+func (a *Admin) SecretBackendConfig(ctx context.Context, backend string) (json.RawMessage, error) {
+	return a.secrets.GetBackendConfig(ctx, backend)
+}
+
+// SetSecretBackendConfig saves a backend's connection config and
+// reloads the snapshot so refs served by that backend re-resolve. The
+// audit row records the normalized config the store kept, not the raw
+// request body — unknown fields (a mistakenly pasted token, say) must
+// not survive anywhere.
+func (a *Admin) SetSecretBackendConfig(ctx context.Context, backend string, cfg json.RawMessage) error {
+	normalized, err := a.secrets.SetBackendConfig(ctx, backend, cfg)
+	if err != nil {
+		return err
+	}
+	a.audit(ctx, "set", "secret_backend", backend, nil, normalized)
+	a.reload(ctx)
+	return nil
+}
+
+// DeleteSecretBackendConfig removes a backend's connection config;
+// secrets pointed at it fail to resolve until it's reconfigured.
+func (a *Admin) DeleteSecretBackendConfig(ctx context.Context, backend string) error {
+	if err := a.secrets.DeleteBackendConfig(ctx, backend); err != nil {
+		return err
+	}
+	a.audit(ctx, "delete", "secret_backend", backend, nil, nil)
+	a.reload(ctx)
+	return nil
+}
+
+// TestSecretBackend checks connectivity and auth for an external
+// secret backend without reading any stored secret.
+func (a *Admin) TestSecretBackend(ctx context.Context, backend string) error {
+	ctx, cancel := context.WithTimeout(ctx, testTimeout)
+	defer cancel()
+	return a.secrets.TestBackend(ctx, backend)
 }
 
 // PatchBudget applies per-window budget changes: a key maps a window
@@ -451,6 +547,89 @@ func (a *Admin) Test(ctx context.Context, id, model string) (TestResult, error) 
 		return TestResult{}, fmt.Errorf("provider %s has no default model; pass one", p.Name)
 	}
 
+	res := a.probe(ctx, drv, p.Name, model)
+	a.audit(ctx, "test", "provider", id, nil, res)
+	return res, nil
+}
+
+// Validate runs the same one-token probe as Test against a provider
+// config that has NOT been persisted — the UI's validate-on-create.
+// The credential_ref must already resolve (the key is stored before
+// validation), so a passing validation means the provider is born
+// working.
+func (a *Admin) Validate(ctx context.Context, p Provider, model string) (TestResult, error) {
+	if err := validateProvider(p); err != nil {
+		return TestResult{}, err
+	}
+	if model == "" {
+		model = p.DefaultModel
+	}
+	if model == "" {
+		return TestResult{}, fmt.Errorf("a model is required to validate a provider")
+	}
+
+	reg, err := provider.Build([]provider.Config{{
+		Name:          p.Name,
+		Kind:          provider.KindAPI,
+		Driver:        p.Driver,
+		BaseURL:       p.BaseURL,
+		CredentialRef: p.CredentialRef,
+		Headers:       p.Headers,
+	}}, a.credentialLookup())
+	if err != nil {
+		return TestResult{}, err
+	}
+	drv, _ := reg.Get(p.Name)
+
+	res := a.probe(ctx, drv, p.Name, model)
+	a.audit(ctx, "validate", "provider", p.Name, nil, res)
+	return res, nil
+}
+
+// AvailableModels proxies the provider's own model-listing endpoint.
+// Drivers that cannot enumerate models (bedrock) return an error the
+// UI turns into its manual-entry fallback.
+func (a *Admin) AvailableModels(ctx context.Context, id string) ([]provider.AvailableModel, error) {
+	p, err := a.get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	snap := a.store.Snapshot()
+	if snap == nil {
+		return nil, fmt.Errorf("routing configuration not loaded yet")
+	}
+	drv, ok := snap.Provider(p.Name)
+	if !ok {
+		return nil, fmt.Errorf("provider %s not in the serving snapshot; wait for the next reload", p.Name)
+	}
+	lister, ok := drv.(provider.ModelLister)
+	if !ok {
+		return nil, fmt.Errorf("driver %s cannot list models: %w", p.Driver, ErrUnsupported)
+	}
+	lctx, cancel := context.WithTimeout(ctx, testTimeout)
+	defer cancel()
+	return lister.ListModels(lctx)
+}
+
+// credentialLookup mirrors the router store's resolver: a ref that
+// fails to resolve builds the driver with an empty key, and the probe
+// reports the provider's own auth error instead of a config error.
+func (a *Admin) credentialLookup() func(string) string {
+	return func(ref string) string {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		val, err := a.secrets.Resolve(ctx, ref)
+		if err != nil {
+			return ""
+		}
+		return val
+	}
+}
+
+// probe runs one one-token completion against drv and books it under
+// purpose='test'. Shared by Test (persisted provider) and Validate
+// (unsaved config).
+func (a *Admin) probe(ctx context.Context, drv provider.Provider, providerName, model string) TestResult {
 	tctx, cancel := context.WithTimeout(ctx, testTimeout)
 	defer cancel()
 	start := time.Now()
@@ -460,7 +639,7 @@ func (a *Admin) Test(ctx context.Context, id, model string) (TestResult, error) 
 		MaxTokens: 1,
 	})
 	res := TestResult{Model: model}
-	entry := ledger.Entry{Provider: p.Name, Model: model, TaskCategory: "admin", Purpose: "test"}
+	entry := ledger.Entry{Provider: providerName, Model: model, TaskCategory: "admin", Purpose: "test"}
 	if err != nil {
 		res.Detail = err.Error()
 		entry.Status, entry.ErrorCode = "error", "invalid_request"
@@ -484,14 +663,14 @@ func (a *Admin) Test(ctx context.Context, id, model string) (TestResult, error) 
 	res.LatencyMS = time.Since(start).Milliseconds()
 	entry.LatencyMS = res.LatencyMS
 	a.rec.Record(ctx, entry)
-	a.audit(ctx, "test", "provider", id, nil, res)
-	return res, nil
+	return res
 }
 
 // Sentinel errors the HTTP layer maps onto status codes.
 var (
-	ErrNotFound = fmt.Errorf("not found")
-	ErrInUse    = fmt.Errorf("in use")
+	ErrNotFound    = fmt.Errorf("not found")
+	ErrInUse       = fmt.Errorf("in use")
+	ErrUnsupported = fmt.Errorf("unsupported")
 )
 
 func (a *Admin) get(ctx context.Context, id string) (Provider, error) {
