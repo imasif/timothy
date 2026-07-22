@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/SumonMSelim/timothy/internal/gateway/stream"
 	"github.com/SumonMSelim/timothy/internal/platform/migrate"
 	"github.com/SumonMSelim/timothy/internal/platform/pgpool"
@@ -38,14 +40,24 @@ func testAggregator(t *testing.T) (*Aggregator, *Ledger) {
 	if err := migrate.Run(ctx, db, migrations.FS, log); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	// Sweep at setup AND teardown (the admin tests' discipline): the
-	// teardown runs after t.Context() is canceled, so its delete can
-	// fail silently and leave rows that double the next test's fixture.
-	sweep := func(ctx context.Context) {
-		_, _ = db.Exec(ctx, "DELETE FROM cost_ledger WHERE provider LIKE $1 || '%'", aggMarker)
-	}
-	sweep(ctx)
-	t.Cleanup(func() { sweep(context.Background()) })
+	// Sweep at setup AND teardown. The teardown runs after t.Context()
+	// is canceled and the pool may already be closed, so it uses an
+	// independent connection — a pool-backed delete would silently fail
+	// and leave rows that double the next test's fixture.
+	_, _ = db.Exec(ctx, "DELETE FROM cost_ledger WHERE provider LIKE $1 || '%'", aggMarker)
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer ccancel()
+		conn, err := pgx.Connect(cctx, dsn)
+		if err != nil {
+			t.Errorf("cleanup connect: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close(cctx) }()
+		if _, err := conn.Exec(cctx, "DELETE FROM cost_ledger WHERE provider LIKE $1 || '%'", aggMarker); err != nil {
+			t.Errorf("cleanup agg rows: %v", err)
+		}
+	})
 	return NewAggregator(pool), New(pool, log)
 }
 
@@ -59,19 +71,19 @@ func seedAgg(t *testing.T, led *Ledger) (from, to time.Time) {
 	base := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Hour)
 
 	rows := []Entry{
-		{Provider: aggMarker + "a", Model: "m1", TaskCategory: "coding", SessionID: "s1",
+		{Provider: aggMarker + "a", Model: "m1", Route: "coding", SessionID: "s1",
 			Usage:     &stream.Usage{InputTokens: 100, OutputTokens: 50, CacheReadTokens: 20},
 			LatencyMS: 100, Status: "ok", CostUSD: usd(0.10)},
-		{Provider: aggMarker + "a", Model: "m1", TaskCategory: "coding", SessionID: "s1",
+		{Provider: aggMarker + "a", Model: "m1", Route: "coding", SessionID: "s1",
 			Usage:     &stream.Usage{InputTokens: 200, OutputTokens: 100},
 			LatencyMS: 300, Status: "ok", CostUSD: usd(0.20)},
-		{Provider: aggMarker + "b", Model: "m2", TaskCategory: "mini", SessionID: "s2",
+		{Provider: aggMarker + "b", Model: "m2", Route: "mini", SessionID: "s2",
 			Usage:     &stream.Usage{InputTokens: 10, OutputTokens: 5},
 			LatencyMS: 50, Status: "ok", CostUSD: usd(0.01)},
-		{Provider: aggMarker + "b", Model: "m2", TaskCategory: "mini", SessionID: "s2",
+		{Provider: aggMarker + "b", Model: "m2", Route: "mini", SessionID: "s2",
 			LatencyMS: 5, Status: "error", ErrorCode: "provider_error"},
 		// Test-connection probe: excluded from every aggregate.
-		{Provider: aggMarker + "a", Model: "m1", TaskCategory: "coding", Purpose: "test",
+		{Provider: aggMarker + "a", Model: "m1", Route: "coding", Purpose: "test",
 			Usage:     &stream.Usage{InputTokens: 999999, OutputTokens: 999999},
 			LatencyMS: 9999, Status: "ok", CostUSD: usd(99.0)},
 	}
