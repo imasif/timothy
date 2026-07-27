@@ -4,12 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/SumonMSelim/timothy/internal/brain/loop"
+	"github.com/SumonMSelim/timothy/internal/brain/tools"
 	"github.com/SumonMSelim/timothy/internal/gateway/stream"
 )
 
@@ -320,6 +324,91 @@ func TestRunWorkerReportsPermissionParkAndClear(t *testing.T) {
 	}
 }
 
+// sequencingParker records, at the moment each OnPermissionCleared
+// fires, how many distinct calls had parked vs how many tool results
+// had been delivered so far — the direct signal that distinguishes
+// "cleared after the right call" from "cleared after the first call
+// resolved regardless of which one" (a plain clear-count is identical
+// in both the buggy and fixed behavior for two concurrent parks).
+type sequencingParker struct {
+	fakeParker
+	resultsDeliveredAtClear []int
+	resultsDelivered        atomic.Int32
+}
+
+func (f *sequencingParker) OnPermissionCleared(ctx context.Context, missionID string) {
+	f.fakeParker.OnPermissionCleared(ctx, missionID)
+	f.resultsDeliveredAtClear = append(f.resultsDeliveredAtClear, int(f.resultsDelivered.Load()))
+}
+
+// TestRunWorkerConcurrentParksClearOnlyWhenAllResolve is the
+// regression for a real incident: a turn issuing two concurrent
+// destructive tool calls, both parked. Before this fix, runTurn's
+// single shared "parked" bool cleared the mission's pending-permission
+// state as soon as the FIRST call's result arrived, even while the
+// second call was still genuinely blocked awaiting a decision — the
+// UI/API then showed nothing pending while a destructive command sat
+// unresolved for up to the full 10-minute timeout.
+func TestRunWorkerConcurrentParksClearOnlyWhenAllResolve(t *testing.T) {
+	parker := &sequencingParker{}
+	agent := &countingResultAgent{
+		scriptedAgent: scriptedAgent{batches: [][]stream.StreamEvent{{
+			textEvent("running two risky tool calls"),
+			permissionRequestEvent("perm1", "call1", "shell", "destructive"),
+			permissionRequestEvent("perm2", "call2", "shell", "destructive"),
+			toolResultEvent("call1"), // first call resolves — must NOT clear yet
+			toolResultEvent("call2"), // second (last) call resolves — NOW it clears
+			toolEndEvent(missionStatusToolName, `{"outcome":"done","evidence":"ran both"}`),
+		}}},
+		parker: parker,
+	}
+	r := newTestRunnerWithParker(agent, parker)
+	v, _, err := r.RunWorker(context.Background(), Mission{ID: "m1", Route: "default"}, WorkPacket{Goal: "test"})
+	if err != nil {
+		t.Fatalf("RunWorker: %v", err)
+	}
+	if v.Outcome != "done" {
+		t.Fatalf("RunWorker verdict = %+v, want done", v)
+	}
+	if len(parker.parked) != 2 {
+		t.Fatalf("parker.parked = %v, want two parks (both concurrent calls)", parker.parked)
+	}
+	if len(parker.resultsDeliveredAtClear) != 1 || parker.resultsDeliveredAtClear[0] != 2 {
+		// The bug this guards: the buggy single-bool version clears
+		// after resultsDelivered==1 (right after call1, prematurely) —
+		// this asserts the clear only happens once BOTH results (2) have
+		// actually been delivered.
+		t.Fatalf("clear fired after %v results delivered, want exactly one clear after both (2) results", parker.resultsDeliveredAtClear)
+	}
+}
+
+// countingResultAgent wraps scriptedAgent's fixed batch with a live
+// counter the test parker reads at clear-time — the pre-buffered
+// channel scriptedAgent uses can't otherwise expose "how far the
+// consumer has gotten" to a callback fired mid-drain.
+type countingResultAgent struct {
+	scriptedAgent
+	parker *sequencingParker
+}
+
+func (f *countingResultAgent) Start(ctx context.Context, req loop.Request) (<-chan stream.StreamEvent, error) {
+	raw, err := f.scriptedAgent.Start(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	out := make(chan stream.StreamEvent)
+	go func() {
+		defer close(out)
+		for ev := range raw {
+			if ev.Type == stream.EventToolResult {
+				f.parker.resultsDelivered.Add(1)
+			}
+			out <- ev
+		}
+	}()
+	return out, nil
+}
+
 // TestRunWorkerClearsPermissionParkOnStreamError covers the other exit
 // path: if the turn errors out while still parked (e.g. the gateway
 // connection drops), the mission row must not be left showing a
@@ -435,5 +524,108 @@ func TestRunWorkerGetsMissionScopedShell(t *testing.T) {
 	}
 	if !slices.Contains(names, missionStatusToolName) {
 		t.Fatalf("worker ExtraTools = %v, want the mission_status sentinel", names)
+	}
+}
+
+// shellExtraTool pulls the "shell" tool out of a mission's ExtraTools
+// list — helper for tests exercising missionTools' Runner wiring
+// directly, without going through a full RunWorker turn.
+func shellExtraTool(t *testing.T, extras []*tools.Tool) *tools.Tool {
+	t.Helper()
+	for _, tool := range extras {
+		if tool.Name == "shell" {
+			return tool
+		}
+	}
+	t.Fatal("no shell tool in ExtraTools")
+	return nil
+}
+
+// TestMissionToolsNoSandboxUsesLocalExec confirms a runner with no
+// sandbox configured builds a shell with no Runner set — the local
+// exec.CommandContext fallback shell.go already had.
+func TestMissionToolsNoSandboxUsesLocalExec(t *testing.T) {
+	r := newTestRunner(&scriptedAgent{})
+	extraTools := r.missionTools(Mission{ID: "m1", Workspace: t.TempDir()})
+	shell := shellExtraTool(t, extraTools)
+	args, _ := json.Marshal(map[string]string{"command": "echo real-exec"})
+	out, err := shell.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if strings.TrimSpace(out) != "real-exec" {
+		t.Fatalf("output = %q, want local exec to have actually run", out)
+	}
+}
+
+// TestMissionToolsSandboxRoutesShell confirms that with r.sandbox set,
+// missionTools wires a shell whose Runner calls the sandbox backend
+// (never local exec) with the mission id and mission's own work root,
+// and formats a non-zero exit code the same way builtin.Shell's local
+// path does ("(exit status N)" appended, no error).
+func TestMissionToolsSandboxRoutesShell(t *testing.T) {
+	dir := t.TempDir()
+	var gotMissionID, gotWorkdir, gotCommand string
+	r := newTestRunner(&scriptedAgent{})
+	r.sandbox = func(ctx context.Context, missionID, workdir, command string, timeout time.Duration, out io.Writer) (int, error) {
+		gotMissionID, gotWorkdir, gotCommand = missionID, workdir, command
+		_, _ = out.Write([]byte("sandboxed output"))
+		return 3, nil
+	}
+	extraTools := r.missionTools(Mission{ID: "m1", Workspace: dir})
+	shell := shellExtraTool(t, extraTools)
+	args, _ := json.Marshal(map[string]string{"command": "false"})
+	out, err := shell.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if gotMissionID != "m1" || gotWorkdir != dir || gotCommand != "false" {
+		t.Fatalf("sandbox called with (%q,%q,%q), want (m1,%s,false)", gotMissionID, gotWorkdir, gotCommand, dir)
+	}
+	if !strings.HasPrefix(out, "sandboxed output") || !strings.Contains(out, "(exit status 3)") {
+		t.Fatalf("output = %q, want sandbox output plus exit-status suffix", out)
+	}
+}
+
+// TestMissionToolsSandboxTimeoutPropagatesAsError confirms a timeout
+// from the sandbox backend surfaces as an error from the shell tool,
+// matching builtin.Shell's local-path contract (a timeout is an error,
+// a non-zero exit is not).
+func TestMissionToolsSandboxTimeoutPropagatesAsError(t *testing.T) {
+	r := newTestRunner(&scriptedAgent{})
+	r.sandbox = func(ctx context.Context, missionID, workdir, command string, timeout time.Duration, out io.Writer) (int, error) {
+		return 124, errors.New("command timed out after 30s")
+	}
+	extraTools := r.missionTools(Mission{ID: "m1", Workspace: t.TempDir()})
+	shell := shellExtraTool(t, extraTools)
+	args, _ := json.Marshal(map[string]string{"command": "sleep 100"})
+	if _, err := shell.Execute(context.Background(), args); err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("Execute err = %v, want a timeout error", err)
+	}
+}
+
+// TestMissionToolsSandboxCapsOutput confirms cappedStringWriter bounds
+// the sandbox Runner's output the same way builtin.Shell's local path
+// caps its own — a runaway sandboxed command must not balloon memory
+// or context just because the local exec path isn't the one running.
+func TestMissionToolsSandboxCapsOutput(t *testing.T) {
+	r := newTestRunner(&scriptedAgent{})
+	over := strings.Repeat("x", shellOutputCap+1024)
+	r.sandbox = func(ctx context.Context, missionID, workdir, command string, timeout time.Duration, out io.Writer) (int, error) {
+		_, _ = out.Write([]byte(over))
+		return 0, nil
+	}
+	extraTools := r.missionTools(Mission{ID: "m1", Workspace: t.TempDir()})
+	shell := shellExtraTool(t, extraTools)
+	args, _ := json.Marshal(map[string]string{"command": "yes"})
+	out, err := shell.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !strings.Contains(out, "[output capped]") {
+		t.Fatalf("output not marked as capped: %q", out[:min(200, len(out))])
+	}
+	if len(out) > shellOutputCap+len("\n[output capped]") {
+		t.Fatalf("output length %d exceeds cap plus marker", len(out))
 	}
 }

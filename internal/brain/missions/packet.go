@@ -20,6 +20,17 @@ type WorkPacket struct {
 	Progress  []ProgressNote
 	GitLog    string
 	Iteration int
+	// PromptOverlay is the creating agent's overlay text, snapshotted
+	// onto the mission at create time — appended to the worker's
+	// system prompt, same instructions a chat session with that agent
+	// would get.
+	PromptOverlay string
+	// ExecEnvironmentNote describes what shell/verify_cmd commands
+	// actually run against (sandbox container vs the minimal in-process
+	// shell) — without this a worker has no way to know whether e.g.
+	// python3 exists, and can report "done" on a step whose own
+	// verify_cmd will fail for want of a runtime that was never there.
+	ExecEnvironmentNote string
 }
 
 // Render turns the packet into the system/user message a worker
@@ -28,7 +39,12 @@ type WorkPacket struct {
 // messages, an earlier note); both pass through NeutralizeSlot before
 // insertion — self-injection hardening.
 func (p WorkPacket) Render() (system, user string) {
-	system = "You are executing one unit of a plan. Work toward the goal, then end your turn with exactly one mission_status tool call: done (with evidence), retry (with analysis), or blocked (with a question). Create or update files ONLY with the write_file tool using workspace-relative paths — never shell redirects (>, >>) or heredocs, which require interactive approval and will stall you. Use shell for reading and checking, not writing. The harness verifies your declared artifacts exist on disk; describing a file is not producing it."
+	system = "You are executing one unit of a plan. Work toward the goal, then end your turn with exactly one mission_status tool call: done (with evidence), retry (with analysis), or blocked (with a question). Create or update files ONLY with the write_file tool using workspace-relative paths — never shell redirects (>, >>) or heredocs, which require interactive approval and will stall you. Use shell for reading and checking, not writing. The harness verifies your declared artifacts exist on disk; describing a file is not producing it." + p.ExecEnvironmentNote
+	if p.PromptOverlay != "" {
+		// Operator-authored config, not model output — unlike Progress/
+		// GitLog below, this never passes through NeutralizeSlot.
+		system += "\n\n" + p.PromptOverlay
+	}
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "Goal: %s\n", NeutralizeSlot(p.Goal))

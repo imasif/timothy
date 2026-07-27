@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
@@ -24,6 +25,7 @@ import (
 	"github.com/SumonMSelim/timothy/internal/brain/loop"
 	"github.com/SumonMSelim/timothy/internal/brain/memclient"
 	"github.com/SumonMSelim/timothy/internal/brain/missions"
+	"github.com/SumonMSelim/timothy/internal/brain/sandbox"
 	"github.com/SumonMSelim/timothy/internal/brain/session"
 	"github.com/SumonMSelim/timothy/internal/brain/settings"
 	"github.com/SumonMSelim/timothy/internal/brain/skills"
@@ -143,7 +145,16 @@ func main() {
 	}
 	go runOutputGC(ctx, outputs, app.Log)
 
-	conns, goog := buildConnectors(app.DB, app.Log)
+	secrets, err := buildSecretStore(app.DB, app.Log)
+	if err != nil {
+		app.Log.Warn("secret store disabled", "error", err)
+	}
+	var resolveSecret func(context.Context, string) (string, error)
+	if secrets != nil {
+		resolveSecret = secrets.Resolve
+	}
+
+	conns, goog := buildConnectors(app.DB, secrets, app.Log)
 	if conns != nil {
 		conns.RegisterBuilder("mcp", connectors.MCPBuilder(nil))
 		if goog != nil {
@@ -155,9 +166,39 @@ func main() {
 		go runConnectorReload(ctx, conns, app.Log)
 	}
 
-	missionStore, missionDriver, missionNotifier := buildMissions(app.DB, agent, store, workspace, app.Log)
+	// Fail closed: an operator who set MISSION_SANDBOX_IMAGE opted into
+	// sandboxed execution, so a manager that cannot initialize (daemon
+	// unreachable, workspace mount unresolvable) must stop the service
+	// loudly — silently falling back to executing model-authored
+	// commands inside brain's own process would defeat the whole point.
+	// A missing image is deliberately NOT fatal: the health check below
+	// reports it, and building it needs no brain restart.
+	missionSandbox, sberr := sandbox.NewManager(ctx, os.Getenv("MISSION_SANDBOX_IMAGE"), app.Log)
+	if sberr != nil {
+		fmt.Fprintln(os.Stderr, sberr)
+		os.Exit(1)
+	}
+
+	missionStore, missionDriver, missionNotifier, missionWorkspace := buildMissions(ctx, app.DB, agent, store, workspace, flags, missionSandbox, app.Log)
 	if missionDriver != nil {
-		go missions.RecoverAndSweep(ctx, missionDriver, missionStore, missionWorkSlotMax, app.Log)
+		var sandboxSweeper interface {
+			Sweep(ctx context.Context, isTerminal func(missionID string) bool) error
+		}
+		if missionSandbox != nil {
+			sandboxSweeper = missionSandbox
+		}
+		go missions.RecoverAndSweep(ctx, missionDriver, missionStore, missionWorkSlotMax, sandboxSweeper, app.Log)
+	}
+	if missionSandbox != nil {
+		app.AddCheck("sandbox", func() httpserver.Check {
+			if err := missionSandbox.Ping(ctx); err != nil {
+				return httpserver.Check{Status: "degraded", Detail: "docker daemon unreachable: " + err.Error()}
+			}
+			if err := missionSandbox.CheckImage(ctx); err != nil {
+				return httpserver.Check{Status: "degraded", Detail: "sandbox image not found: " + err.Error()}
+			}
+			return httpserver.Check{Status: "ok"}
+		})
 	}
 
 	agentReg := agents.NewStore(app.DB, app.Log)
@@ -203,7 +244,8 @@ func main() {
 
 	api.Register(app.Server, svc, store, broker,
 		memoryProxy(memorydURL, app.Log), adminProxy(gatewayURL, app.Log), flags,
-		agentReg, conns, goog, agent, missionStore, missionDriver, missionNotifier, token, app.Log)
+		agentReg, conns, goog, agent, missionStore, missionDriver, missionNotifier,
+		missionWorkspace, resolveSecret, token, app.Log)
 
 	if err := app.Run(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		app.Log.Error("server exited", "error", err)
@@ -211,22 +253,33 @@ func main() {
 	}
 }
 
-// buildConnectors wires the integration control plane. Brain resolves
-// connector credentials through its own secret-store handle (same DB,
-// same master key as the gateway); without a valid master key the
-// connector surface stays unmounted and the rest of brain runs. The
-// Google half additionally needs TIMOTHY_PUBLIC_URL for the OAuth
-// redirect; without it google connectors are configured but cannot
-// connect.
-func buildConnectors(db *pgpool.Pool, log *slog.Logger) (*connectors.Manager, *connectors.Google) {
+// buildSecretStore builds brain's secret-store handle (same DB, same
+// master key as the gateway) — shared by connectors and mission push,
+// so it's built once here rather than each caller decoding the master
+// key independently. A nil return (with an error to log) means an
+// unusable master key or init failure; callers nil-gate on it.
+func buildSecretStore(db *pgpool.Pool, log *slog.Logger) (*secretstore.Store, error) {
 	masterKey, err := secretstore.DecodeMasterKey(os.Getenv(secretstore.MasterKeyEnv))
 	if err != nil {
-		log.Warn("connectors disabled: no usable master key", "error", err)
-		return nil, nil
+		return nil, fmt.Errorf("no usable master key: %w", err)
 	}
 	secrets, err := secretstore.New(db, masterKey)
 	if err != nil {
-		log.Warn("connectors disabled: secret store init failed", "error", err)
+		return nil, fmt.Errorf("secret store init failed: %w", err)
+	}
+	return secrets, nil
+}
+
+// buildConnectors wires the integration control plane. secrets is
+// brain's already-built secret-store handle (nil when unavailable,
+// e.g. no valid master key) — a nil store still nil-gates the
+// connector surface exactly as before, it's just built once in main()
+// instead of here. The Google half additionally needs
+// TIMOTHY_PUBLIC_URL for the OAuth redirect; without it google
+// connectors are configured but cannot connect.
+func buildConnectors(db *pgpool.Pool, secrets *secretstore.Store, log *slog.Logger) (*connectors.Manager, *connectors.Google) {
+	if secrets == nil {
+		log.Warn("connectors disabled: no secret store")
 		return nil, nil
 	}
 	resolve := func(ctx context.Context, ref string) (string, error) {
@@ -258,14 +311,17 @@ const missionWorkSlotMax = 4
 // missions stay entirely inert — no goroutines started, nothing
 // scheduled, the API surface unmounted (registerMissions 404s on a nil
 // store).
-func buildMissions(db *pgpool.Pool, agent *loop.Agent, sessions *session.Store, toolWorkspaceRoot string, log *slog.Logger) (*missions.Store, *missions.Driver, *missions.Notifier) {
+func buildMissions(ctx context.Context, db *pgpool.Pool, agent *loop.Agent, sessions *session.Store, toolWorkspaceRoot string, flags *settings.Store, sandboxMgr *sandbox.Manager, log *slog.Logger) (*missions.Store, *missions.Driver, *missions.Notifier, *missions.Workspace) {
 	root := os.Getenv("WORKSPACES")
 	if root == "" {
 		log.Info("WORKSPACES not set; missions disabled")
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	store := missions.NewStore(db, log)
-	workspace := missions.NewWorkspace(root, log)
+	identity := func(ctx context.Context) (string, string) {
+		return flags.Value(ctx, settings.ValueGitAuthorName), flags.Value(ctx, settings.ValueGitAuthorEmail)
+	}
+	workspace := missions.NewWorkspace(root, identity, log)
 	parker := missions.NewStorePermissionParker(store, log)
 	// MISSION_MODEL_FLOOR lists model-name substrings (comma-separated)
 	// too weak to drive tool-using mission turns; a turn served by one
@@ -277,7 +333,15 @@ func buildMissions(db *pgpool.Pool, agent *loop.Agent, sessions *session.Store, 
 			floorDeny = append(floorDeny, s)
 		}
 	}
-	runner := missions.NewNativeRunnerWithFloor(agent, parker, floorDeny, log)
+	// sandboxMgr non-nil routes model-authored command execution (the
+	// worker/reviewer shell, verify_cmd) OUT of brain's own process into
+	// a per-mission Docker container; nil (MISSION_SANDBOX_IMAGE unset)
+	// keeps the original in-process exec.CommandContext behavior.
+	var sandboxExec func(context.Context, string, string, string, time.Duration, io.Writer) (int, error)
+	if sandboxMgr != nil {
+		sandboxExec = sandboxMgr.Exec
+	}
+	runner := missions.NewNativeRunnerWithFloor(agent, parker, floorDeny, sandboxExec, log)
 	webhookURL := os.Getenv("NOTIFY_WEBHOOK_URL")
 	notifier := missions.NewNotifier(db, webhookURL, log)
 	// A second tools.Permissions instance, not the one buildAgent built —
@@ -286,10 +350,13 @@ func buildMissions(db *pgpool.Pool, agent *loop.Agent, sessions *session.Store, 
 	// only to pre-authorize a mission's hidden session at creation.
 	perms := tools.NewPermissions(db, toolWorkspaceRoot)
 	driver := missions.NewDriver(store, runner, workspace, notifier, sessions, perms, log)
+	if sandboxMgr != nil {
+		driver.SetSandbox(sandboxExec, sandboxMgr)
+	}
 
 	scheduler := missions.NewScheduler(db, store, log)
-	go scheduler.Run(context.Background())
-	return store, driver, notifier
+	go scheduler.Run(ctx)
+	return store, driver, notifier, workspace
 }
 
 // memoryProxy forwards the web's memory-management routes to memoryd

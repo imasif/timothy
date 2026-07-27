@@ -23,6 +23,25 @@ const (
 type ShellConfig struct {
 	WorkspaceRoot string
 	Timeout       time.Duration // 0 = shellDefaultTimeout
+	// MaxTimeout caps a model-requested timeout_seconds; 0 = ShellMaxTimeout
+	// (120s, chat's global shell). Missions running in a sandboxed
+	// container set this higher (app builds, test suites, package
+	// installs routinely exceed 120s) — see missions.missionTools.
+	// Enforced directly in Execute so it applies regardless of whether
+	// ShellTimeoutClamp's constraint-middleware path runs; ExtraTools
+	// (what missions use) bypass that middleware entirely, so this is
+	// the only enforcement a mission-scoped shell actually gets.
+	MaxTimeout time.Duration
+
+	// Runner, when non-nil, executes the command in a sandboxed backend
+	// (a per-mission Docker container) instead of brain's own process —
+	// nil keeps the original in-process exec.CommandContext behavior
+	// (the only path chat's global shell ever uses). The contract mirrors
+	// runShell exactly: return combined output plus nil error for any
+	// exit code, and an error only for a timeout or an infrastructure
+	// failure — callers (missions.missionTools) are responsible for
+	// producing that shape from whatever their backend returns.
+	Runner func(ctx context.Context, command string, timeout time.Duration) (string, error)
 }
 
 type shellArgs struct {
@@ -59,6 +78,11 @@ func Shell(cfg ShellConfig) *tools.Tool {
 	if timeout <= 0 {
 		timeout = shellDefaultTimeout
 	}
+	maxTimeout := cfg.MaxTimeout
+	if maxTimeout <= 0 {
+		maxTimeout = ShellMaxTimeout
+	}
+	maxSecondsText := fmt.Sprintf("%d", int(maxTimeout/time.Second))
 	return &tools.Tool{
 		Name: "shell",
 		Description: `Runs a shell command in the workspace directory.
@@ -72,7 +96,7 @@ Arguments:
 - command (string, required): the command line to run, e.g.
   "ls -la reports/" or "grep -rn 'TODO' src/ | head -20".
 - timeout_seconds (integer, optional): seconds before the command is
-  killed. Default 30, maximum 120 (higher values are clamped).
+  killed. Default 30, maximum ` + maxSecondsText + ` (higher values are clamped).
 
 Returns combined stdout and stderr. A non-zero exit is reported with
 the exit status alongside whatever output the command produced.
@@ -93,7 +117,7 @@ Example: {"command": "wc -l notes.md"} → "42 notes.md"`,
 				},
 				"timeout_seconds": {
 					"type": "integer",
-					"description": "Seconds before the command is killed (default 30, max 120)"
+					"description": "Seconds before the command is killed (default 30, max ` + maxSecondsText + `)"
 				}
 			},
 			"required": ["command"],
@@ -114,6 +138,16 @@ Example: {"command": "wc -l notes.md"} → "42 notes.md"`,
 			if args.TimeoutSeconds > 0 {
 				runTimeout = time.Duration(args.TimeoutSeconds) * time.Second
 			}
+			// Enforced here, not just in ShellTimeoutClamp: ExtraTools
+			// (mission-scoped shells) bypass the constraint middleware
+			// entirely, so a clamp registered only on the base registry
+			// would never run for them. This is the actual ceiling.
+			if runTimeout > maxTimeout {
+				runTimeout = maxTimeout
+			}
+			if runTimeout <= 0 {
+				runTimeout = timeout
+			}
 			// The permission chain's sandbox check on absolute path
 			// tokens is lexical only, so a symlink planted inside the
 			// workspace pointing outside it would otherwise reach the
@@ -121,6 +155,9 @@ Example: {"command": "wc -l notes.md"} → "42 notes.md"`,
 			// right before the command actually runs.
 			if err := tools.CheckCommandPaths(cfg.WorkspaceRoot, args.Command); err != nil {
 				return "", err
+			}
+			if cfg.Runner != nil {
+				return cfg.Runner(ctx, args.Command, runTimeout)
 			}
 			return runShell(ctx, cfg.WorkspaceRoot, runTimeout, args.Command)
 		},

@@ -5,12 +5,23 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/SumonMSelim/timothy/internal/brain/tools"
 )
+
+// verifyBackend runs verify_cmd via a sandbox container instead of
+// brain's own process, streaming combined output to out and returning
+// the exit code — RunVerifyWithBackend's counterpart to
+// missionTools' shell Runner hook. err is non-nil only for an
+// infrastructure failure (never a non-zero exit, which is a normal,
+// evidence-bearing outcome reported via the exit code).
+type verifyBackend func(ctx context.Context, workdir, command string, timeout time.Duration, out io.Writer) (exitCode int, err error)
 
 // verifyTimeout bounds one plan unit's verify_cmd.
 const verifyTimeout = 10 * time.Minute
@@ -48,7 +59,38 @@ func RunVerify(ctx context.Context, workRoot, verifyCmd string) (VerifyResult, e
 			return VerifyResult{}, runErr // context deadline, command not found, etc.
 		}
 	}
+	return newVerifyResult(exitCode, out), nil
+}
 
+// RunVerifyWithBackend is RunVerify's sandbox-routed counterpart:
+// verify_cmd runs via backend (a sandbox container) instead of
+// brain's own process. Output is streamed into a sha256 hash and a
+// bounded tail buffer rather than collected in full — a verify_cmd
+// with runaway output must not balloon memory the way a plain
+// CombinedOutput() would, and the resulting VerifyResult carries the
+// same evidence shape (digest + excerpt) either way.
+func RunVerifyWithBackend(ctx context.Context, backend verifyBackend, workRoot, verifyCmd string) (VerifyResult, error) {
+	cctx, cancel := context.WithTimeout(ctx, verifyTimeout)
+	defer cancel()
+
+	hash := sha256.New()
+	tail := &tailBuffer{max: verifyExcerptCap}
+	exitCode, err := backend(cctx, workRoot, verifyCmd, verifyTimeout, io.MultiWriter(hash, tail))
+	if err != nil {
+		return VerifyResult{}, err
+	}
+	return VerifyResult{
+		ExitCode:     exitCode,
+		OutputSHA256: hex.EncodeToString(hash.Sum(nil)),
+		Excerpt:      tail.String(),
+		Passed:       exitCode == 0,
+	}, nil
+}
+
+// newVerifyResult builds a VerifyResult from a fully-collected output
+// buffer — RunVerify's local-exec shape, where CombinedOutput already
+// returns the whole thing.
+func newVerifyResult(exitCode int, out []byte) VerifyResult {
 	digest := sha256.Sum256(out)
 	excerpt := out
 	if len(excerpt) > verifyExcerptCap {
@@ -59,8 +101,26 @@ func RunVerify(ctx context.Context, workRoot, verifyCmd string) (VerifyResult, e
 		OutputSHA256: hex.EncodeToString(digest[:]),
 		Excerpt:      string(excerpt),
 		Passed:       exitCode == 0,
-	}, nil
+	}
 }
+
+// tailBuffer keeps only the last max bytes written to it — a bounded
+// alternative to buffering a verify_cmd's entire (potentially huge)
+// output just to keep its trailing excerpt.
+type tailBuffer struct {
+	buf []byte
+	max int
+}
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	t.buf = append(t.buf, p...)
+	if len(t.buf) > t.max {
+		t.buf = t.buf[len(t.buf)-t.max:]
+	}
+	return len(p), nil
+}
+
+func (t *tailBuffer) String() string { return string(t.buf) }
 
 // CheckArtifacts verifies each declared workspace-relative artifact
 // path exists under workRoot and is non-empty, returning a
@@ -85,7 +145,16 @@ func CheckArtifacts(workRoot string, artifacts []string) []string {
 			problems = append(problems, fmt.Sprintf("%s: artifact path escapes the workspace", rel))
 			continue
 		}
-		info, err := os.Stat(filepath.Join(workRoot, cleaned))
+		abs := filepath.Join(workRoot, cleaned)
+		if err := tools.WithinRoot(workRoot, abs); err != nil {
+			if tools.IsViolation(err) {
+				problems = append(problems, fmt.Sprintf("%s: artifact path escapes the workspace", rel))
+			} else {
+				problems = append(problems, fmt.Sprintf("%s: cannot verify workspace root: %v", rel, err))
+			}
+			continue
+		}
+		info, err := os.Stat(abs)
 		switch {
 		case err != nil:
 			problems = append(problems, fmt.Sprintf("%s: not found in the workspace", rel))

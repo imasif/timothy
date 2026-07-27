@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/SumonMSelim/timothy/internal/brain/loop"
 	"github.com/SumonMSelim/timothy/internal/brain/tools"
@@ -101,6 +103,15 @@ type parkNotifier interface {
 	OnPermissionCleared(ctx context.Context, missionID string)
 }
 
+// sandboxExec is the narrow slice of *sandbox.Manager nativeRunner
+// needs — kept as a function type (not an import of the sandbox
+// package) so missions has no compile-time dependency on Docker; the
+// driver wires the real *sandbox.Manager.Exec in cmd/brain/main.go.
+// nil means no sandbox is configured: missionTools then builds a
+// Runner-less shell, which falls back to shell.go's original
+// in-process exec.CommandContext.
+type sandboxExec func(ctx context.Context, missionID, workdir, command string, timeout time.Duration, out io.Writer) (exitCode int, err error)
+
 // nativeRunner is Phase 1's only Runner: every call is one loop.Agent
 // turn over the gateway, tagged with the mission's route/review_route
 // and MissionID (for ledger attribution).
@@ -113,6 +124,11 @@ type nativeRunner struct {
 	// served by one returns ErrModelFloor so the driver pauses fast
 	// instead of burning iterations. Empty = floor disabled.
 	modelFloorDeny []string
+	// sandbox executes worker/reviewer shell commands in a per-mission
+	// Docker container instead of brain's own process — never nil in
+	// the fully in-process fallback, since missionTools checks it and
+	// only wires builtin.ShellConfig.Runner when it's set.
+	sandbox sandboxExec
 }
 
 // NewNativeRunner wraps a production *loop.Agent as a Runner. The
@@ -125,9 +141,13 @@ func NewNativeRunner(agent *loop.Agent, parker parkNotifier, log *slog.Logger) R
 }
 
 // NewNativeRunnerWithFloor is NewNativeRunner plus a model floor deny
-// list (see nativeRunner.modelFloorDeny).
-func NewNativeRunnerWithFloor(agent *loop.Agent, parker parkNotifier, floorDeny []string, log *slog.Logger) Runner {
-	return &nativeRunner{agent: agent, parker: parker, modelFloorDeny: floorDeny, log: log}
+// list (see nativeRunner.modelFloorDeny) and a sandbox exec backend
+// (a *sandbox.Manager.Exec closure) — worker and reviewer shell calls
+// route through it instead of brain's own process. sandbox nil (what
+// happens when MISSION_SANDBOX_IMAGE is unset) keeps the original
+// in-process behavior.
+func NewNativeRunnerWithFloor(agent *loop.Agent, parker parkNotifier, floorDeny []string, sandbox sandboxExec, log *slog.Logger) Runner {
+	return &nativeRunner{agent: agent, parker: parker, modelFloorDeny: floorDeny, sandbox: sandbox, log: log}
 }
 
 // missionTools builds the turn-scoped file tools rooted in the
@@ -136,19 +156,81 @@ func NewNativeRunnerWithFloor(agent *loop.Agent, parker parkNotifier, floorDeny 
 // the root cause of a whole failure family was workers writing into
 // the shared root while verify_cmd and the reviewer looked in the
 // per-mission directory — and write_file, so artifact writes never go
-// through destructive-classified shell redirects.
-func missionTools(m Mission) []*tools.Tool {
-	root := m.Worktree
-	if root == "" {
-		root = m.Workspace
-	}
+// through destructive-classified shell redirects. When r.sandbox is
+// set, the shell's Runner routes commands into the mission's own
+// Docker container (see builtin.ShellConfig.Runner) instead of
+// brain's own process.
+// sandboxShellMaxTimeout is the mission shell's timeout ceiling when
+// backed by a sandbox container — 120s (chat's shell ceiling) is far
+// too tight for app-development work: package installs, builds, and
+// test suites routinely run longer. The container's own resource caps
+// (memory/CPU/pids) bound the damage a long-running command can do, so
+// a longer ceiling here is a capability tradeoff, not a safety one.
+const sandboxShellMaxTimeout = 15 * time.Minute
+
+func (r *nativeRunner) missionTools(m Mission) []*tools.Tool {
+	root := m.WorkRoot()
 	if root == "" {
 		return nil
 	}
+	shellCfg := builtin.ShellConfig{WorkspaceRoot: root}
+	if r.sandbox != nil {
+		shellCfg.MaxTimeout = sandboxShellMaxTimeout
+		missionID, workdir := m.ID, root
+		shellCfg.Runner = func(ctx context.Context, command string, timeout time.Duration) (string, error) {
+			var out strings.Builder
+			capped := &cappedStringWriter{w: &out, max: shellOutputCap}
+			exitCode, err := r.sandbox(ctx, missionID, workdir, command, timeout, capped)
+			if err != nil {
+				// The sandbox backend's contract mirrors runShell's: a
+				// timeout comes back as an error, everything else
+				// (including a non-zero exit reached via the returned
+				// exitCode) does not.
+				return out.String(), err
+			}
+			result := out.String()
+			if capped.truncated {
+				result += "\n[output capped]"
+			}
+			if exitCode != 0 {
+				result = fmt.Sprintf("%s\n(exit status %d)", result, exitCode)
+			}
+			return result, nil
+		}
+	}
 	return []*tools.Tool{
-		builtin.Shell(builtin.ShellConfig{WorkspaceRoot: root}),
+		builtin.Shell(shellCfg),
 		builtin.WriteFile(builtin.WriteFileConfig{Root: root}),
 	}
+}
+
+// shellOutputCap mirrors builtin.Shell's own output cap — the sandbox
+// backend's Runner must behave identically to the in-process path, not
+// let a runaway sandboxed command balloon memory.
+const shellOutputCap = 64 << 10
+
+// cappedStringWriter stops retaining bytes past max (writes still
+// succeed so the underlying exec can finish) — the sandbox-Runner
+// analog of builtin.capWriter, kept separate because that type is
+// unexported in the builtin package.
+type cappedStringWriter struct {
+	w         *strings.Builder
+	max       int
+	truncated bool
+}
+
+func (c *cappedStringWriter) Write(p []byte) (int, error) {
+	if room := c.max - c.w.Len(); room > 0 {
+		if len(p) > room {
+			c.w.Write(p[:room])
+			c.truncated = true
+		} else {
+			c.w.Write(p)
+		}
+	} else if len(p) > 0 {
+		c.truncated = true
+	}
+	return len(p), nil
 }
 
 // belowFloor reports whether model matches the deny list.
@@ -172,7 +254,11 @@ func (r *nativeRunner) runTurn(ctx context.Context, req loop.Request, sentinelTo
 		return "", nil, err
 	}
 	var b strings.Builder
-	parked := false
+	// parked tracks in-flight parks by CallID, not a single flag — a
+	// turn can issue concurrent tool calls (executeAll runs up to
+	// maxParallelTools at once), so a sibling call finishing first must
+	// not be mistaken for the still-blocked destructive one resolving.
+	parked := map[string]bool{}
 	servedModel := ""
 	for ev := range events {
 		switch ev.Type {
@@ -184,25 +270,26 @@ func (r *nativeRunner) runTurn(ctx context.Context, req loop.Request, sentinelTo
 			}
 		case stream.EventPermissionRequest:
 			if r.parker != nil && ev.Permission != nil {
-				parked = true
+				parked[ev.Permission.CallID] = true
 				r.parker.OnPermissionParked(ctx, req.MissionID, ev.Permission.ID, ev.Permission.Tool,
 					ev.Permission.Args, ev.Permission.Danger, ev.Permission.Rationale)
 			}
 		case stream.EventToolResult:
-			// Any tool result clears a park — resolving the very call
-			// that parked ends it; a parallel call finishing first would
-			// clear early, but Phase 1's worker/reviewer/planner turns
-			// never issue overlapping tool calls, so this stays exact.
-			if parked && r.parker != nil {
-				parked = false
-				r.parker.OnPermissionCleared(ctx, req.MissionID)
+			// Only the specific call that parked clears it — and only
+			// once every parked call in this turn has resolved does the
+			// mission stop reporting a pending permission.
+			if ev.ToolResult != nil && parked[ev.ToolResult.ID] {
+				delete(parked, ev.ToolResult.ID)
+				if len(parked) == 0 && r.parker != nil {
+					r.parker.OnPermissionCleared(ctx, req.MissionID)
+				}
 			}
 		case stream.EventDone:
 			if ev.Meta != nil {
 				servedModel = ev.Meta.Model
 			}
 		case stream.EventError:
-			if parked && r.parker != nil {
+			if len(parked) > 0 && r.parker != nil {
 				r.parker.OnPermissionCleared(ctx, req.MissionID)
 			}
 			return b.String(), sentinelArgs, fmt.Errorf("mission runner: %s", ev.Err.Message)
@@ -235,7 +322,7 @@ func workerRoute(m Mission) string {
 // retry, never a silent accept.
 func (r *nativeRunner) RunWorker(ctx context.Context, m Mission, packet WorkPacket) (WorkerVerdict, string, error) {
 	system, user := packet.Render()
-	extra := append([]*tools.Tool{MissionStatusTool()}, missionTools(m)...)
+	extra := append([]*tools.Tool{MissionStatusTool()}, r.missionTools(m)...)
 	req := loop.Request{
 		SessionID:  m.SessionID,
 		Route:      workerRoute(m),
@@ -306,7 +393,7 @@ func (r *nativeRunner) RunReview(ctx context.Context, m Mission, packet ReviewPa
 	}
 	messages = append(messages, provider.Message{Role: "user", Content: content})
 
-	extra := append([]*tools.Tool{ReviewVerdictTool()}, missionTools(m)...)
+	extra := append([]*tools.Tool{ReviewVerdictTool()}, r.missionTools(m)...)
 	req := loop.Request{
 		SessionID:  m.SessionID,
 		Route:      m.ReviewRoute,
@@ -400,7 +487,7 @@ func renderReviewContent(p ReviewPacket) string {
 // PlanSession runs the planning turn that produces a Spec from the
 // mission's goal and research-phase findings.
 func (r *nativeRunner) PlanSession(ctx context.Context, m Mission, researchNotes string) (Spec, error) {
-	system := "You are planning one mission. Break the goal into the SMALLEST ordered list of verifiable units that achieves it — one unit is correct for a simple goal; never pad the plan. Reply with ONLY a JSON object: {\"units\":[{\"title\":\"...\",\"artifacts\":[\"relative/path.md\"],\"verify_cmd\":\"...\"}]}. artifacts lists the workspace-relative file(s) the unit must produce — the harness itself checks each exists and is non-empty, so name the real deliverables. verify_cmd is executed literally as `/bin/sh -c \"<verify_cmd>\"` in the mission's own workspace directory — it must be a real POSIX shell command (using binaries like grep, test, wc — NOT a tool name from your own tool list, which does not exist as a shell command) and must check the CONTENT of the artifacts (e.g. grep -qi 'retry-after' summary.md), never a bare echo, which proves nothing. Use paths relative to the workspace; never /tmp or any absolute path outside it, since the worker's shell is confined to the workspace."
+	system := "You are planning one mission. Break the goal into the SMALLEST ordered list of verifiable units that achieves it — one unit is correct for a simple goal; never pad the plan. Reply with ONLY a JSON object: {\"units\":[{\"title\":\"...\",\"artifacts\":[\"relative/path.md\"],\"verify_cmd\":\"...\"}]}. artifacts lists the workspace-relative file(s) the unit must produce — the harness itself checks each exists and is non-empty, so name the real deliverables. verify_cmd is executed literally as `/bin/sh -c \"<verify_cmd>\"` in the mission's own workspace directory — it must be a real POSIX shell command (using binaries like grep, test, wc — NOT a tool name from your own tool list, which does not exist as a shell command) and must check the CONTENT of the artifacts (e.g. grep -qi 'retry-after' summary.md), never a bare echo, which proves nothing. Use paths relative to the workspace; never /tmp or any absolute path outside it, since the worker's shell is confined to the workspace." + r.execEnvironmentNote()
 	user := "Goal: " + NeutralizeSlot(m.Goal)
 	if researchNotes != "" {
 		user += "\n\nResearch findings:\n" + NeutralizeSlot(researchNotes)
@@ -418,6 +505,28 @@ func (r *nativeRunner) PlanSession(ctx context.Context, m Mission, researchNotes
 		return Spec{}, err
 	}
 	return parseSpec(text)
+}
+
+// execEnvironmentNote tells the planner what execution environment
+// verify_cmd and shell commands actually run in — without this, a
+// planner with no sandbox has no way to know whether e.g. python3
+// exists, and can author a verify_cmd for a runtime that was never
+// there (the root cause of a real stuck mission: a plan's verify_cmd
+// assumed Python in an environment that had none). WorkPacket.Render
+// carries the same text to the worker via ExecEnvironmentNote.
+func (r *nativeRunner) execEnvironmentNote() string {
+	return execEnvironmentNote(r.sandbox != nil)
+}
+
+// execEnvironmentNote is the shared wording nativeRunner (planner
+// prompt) and Driver (worker packet) both need — kept as one function
+// so the two prompts never drift out of sync about what's actually
+// available.
+func execEnvironmentNote(sandboxed bool) string {
+	if sandboxed {
+		return " Commands run inside an isolated Linux container with python3, node, git, and standard POSIX/coreutils tools available; each mission gets its own container, state persists across your commands within the mission."
+	}
+	return " Commands run in a minimal shell environment — do not assume python3, node, or any interpreter beyond POSIX shell builtins and coreutils (grep, sed, awk, wc, test) are present; verify_cmd must only rely on tools you can confirm exist."
 }
 
 // parseSpec decodes the planner's reply strictly: fences stripped,

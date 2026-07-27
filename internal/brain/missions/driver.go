@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"strings"
 	"sync"
@@ -73,6 +74,15 @@ type driverStore interface {
 	AppendProgress(ctx context.Context, id, note string) error
 }
 
+// sandboxRemover is the narrow slice of *sandbox.Manager Driver needs —
+// kept as an interface (not an import of the sandbox package) so
+// missions has no compile-time dependency on Docker; cmd/brain/main.go
+// wires the real *sandbox.Manager. Nil means no sandbox is configured
+// (the in-process-exec fallback everywhere else in this package).
+type sandboxRemover interface {
+	Remove(ctx context.Context, missionID string) error
+}
+
 // Driver walks the state machine for one mission: calls Runner for the
 // phase-appropriate session type, interprets the outcome into a
 // StepInput, calls Step, and persists the Transition via
@@ -87,6 +97,15 @@ type Driver struct {
 	perms     sessionGranter
 	log       *slog.Logger
 	cfg       Config
+
+	// sandboxExec, when set, routes a plan unit's verify_cmd through the
+	// mission's sandbox container instead of brain's own process — the
+	// same backend nativeRunner uses for worker/reviewer shell calls
+	// (see SetSandboxExec). sandboxRemove tears the container down at a
+	// mission's terminal transition; both are nil in the fully
+	// in-process fallback (MISSION_SANDBOX_IMAGE unset).
+	sandboxExec   sandboxExec
+	sandboxRemove sandboxRemover
 
 	// gatekeepers holds each mission's in-progress reviewer session
 	// state, keyed by mission id, for the "delta recheck" resume on
@@ -117,6 +136,35 @@ func NewDriver(store driverStore, runner Runner, workspace *Workspace, notify no
 		gatekeepers: map[string]*GatekeeperState{},
 		driving:     map[string]bool{},
 	}
+}
+
+// SetSandbox wires a per-mission sandbox exec backend and its
+// container remover — cmd/brain/main.go calls this only when
+// MISSION_SANDBOX_IMAGE is configured, leaving both nil (the
+// in-process fallback) otherwise.
+func (d *Driver) SetSandbox(exec sandboxExec, remove sandboxRemover) {
+	d.sandboxExec, d.sandboxRemove = exec, remove
+}
+
+// removeSandbox best-effort tears down a mission's sandbox container in
+// the background — a slow or unreachable daemon must never block the
+// terminal state transition (or the notify that follows it), only log
+// the failure. The boot-time orphan sweep is the backstop for a removal
+// that fails here.
+func (d *Driver) removeSandbox(id string) {
+	if d.sandboxRemove == nil {
+		return
+	}
+	go func() {
+		// Independent of the transition's own ctx: the mission is already
+		// terminal, so this cleanup must not be tied to a request that
+		// may be winding down.
+		rctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := d.sandboxRemove.Remove(rctx, id); err != nil {
+			d.log.Warn("driver: sandbox container removal failed", "mission_id", id, "error", err)
+		}
+	}()
 }
 
 // Create opens the mission's hidden bookkeeping session, inserts the
@@ -226,6 +274,14 @@ func (d *Driver) Advance(ctx context.Context, id string) (canContinue bool, err 
 		d.log.Warn("driver: record turn failed", "mission_id", id, "error", evErr)
 	}
 
+	// runPhase may have written spec changes of its own (e.g. review's
+	// verifyCurrentUnit -> markUnitPassed flipping a unit to passed) —
+	// re-fetch so the completion check below sees that write rather
+	// than the pre-round snapshot loaded at the top of this call.
+	m, err = d.store.Get(ctx, id)
+	if err != nil {
+		return false, fmt.Errorf("driver advance: reload after phase: %w", err)
+	}
 	state := toStepState(m)
 	t := Step(state, in, d.cfg)
 	if err := d.store.ApplyTransition(ctx, id, t); err != nil {
@@ -233,6 +289,7 @@ func (d *Driver) Advance(ctx context.Context, id string) (canContinue bool, err 
 	}
 	if t.Next.Phase.Terminal() {
 		delete(d.gatekeepers, id)
+		d.removeSandbox(id)
 	}
 	if d.notify != nil {
 		if err := d.notify.OnTransition(ctx, id, before, t.Next.Status); err != nil {
@@ -307,6 +364,7 @@ func (d *Driver) Signal(ctx context.Context, id string, input Input) error {
 	}
 	if t.Next.Phase.Terminal() {
 		delete(d.gatekeepers, id)
+		d.removeSandbox(id)
 	}
 	if d.notify != nil {
 		if err := d.notify.OnTransition(ctx, id, before, t.Next.Status); err != nil {
@@ -335,13 +393,18 @@ func toStepState(m Mission) StepState {
 	}
 }
 
+// isLastUnit reports whether every unit in the plan has passed — the
+// mission is only done once nothing remains unverified, not merely
+// when the first still-unverified unit happens to sit at the last
+// index (that check alone is one unit short: it's true the moment the
+// second-to-last unit passes, before the actual last unit ever runs).
 func isLastUnit(spec Spec) bool {
-	for i, u := range spec.Units {
+	for _, u := range spec.Units {
 		if !u.Passes {
-			return i == len(spec.Units)-1
+			return false
 		}
 	}
-	return true // no unverified units left
+	return true
 }
 
 // runPhase runs the phase-appropriate session and returns the StepInput
@@ -481,10 +544,7 @@ func (d *Driver) runReview(ctx context.Context, m Mission) (StepInput, error) {
 			return StepInput{}, err
 		}
 	}
-	workRoot := m.Worktree
-	if workRoot == "" {
-		workRoot = m.Workspace
-	}
+	workRoot := m.WorkRoot()
 	packet := ReviewPacket{
 		Goal: m.Goal, Plan: m.Spec, Diff: diff, Evidence: m.LastEvidence,
 		Listing: ListWorkspace(workRoot),
@@ -590,10 +650,7 @@ func (d *Driver) verifyCurrentUnit(ctx context.Context, m Mission) error {
 		if u.Passes {
 			continue
 		}
-		workRoot := m.Worktree
-		if workRoot == "" {
-			workRoot = m.Workspace
-		}
+		workRoot := m.WorkRoot()
 		if problems := CheckArtifacts(workRoot, u.Artifacts); len(problems) > 0 {
 			excerpt := "declared artifacts failed the harness check:\n" + strings.Join(problems, "\n")
 			// Show what DOES exist: the dominant failure here is a
@@ -615,7 +672,7 @@ func (d *Driver) verifyCurrentUnit(ctx context.Context, m Mission) error {
 		if u.VerifyCmd == "" {
 			return d.markUnitPassed(ctx, m, i)
 		}
-		res, err := RunVerify(ctx, workRoot, u.VerifyCmd)
+		res, err := d.runVerify(ctx, m.ID, workRoot, u.VerifyCmd)
 		if err != nil {
 			return fmt.Errorf("driver: verify unit %d: %w", i, err)
 		}
@@ -632,9 +689,16 @@ func (d *Driver) verifyCurrentUnit(ctx context.Context, m Mission) error {
 	return nil
 }
 
+// markUnitPassed persists unit as passed. It copies Units before
+// mutating — m.Spec.Units is a slice header, so writing through it
+// in place would silently mutate the caller's own Mission value too
+// (same backing array), corrupting whatever that caller does with it
+// afterward in the same round (e.g. Advance's toStepState(m) call).
 func (d *Driver) markUnitPassed(ctx context.Context, m Mission, unit int) error {
-	m.Spec.Units[unit].Passes = true
-	return d.store.SetSpec(ctx, m.ID, m.Spec)
+	units := make([]PlanUnit, len(m.Spec.Units))
+	copy(units, m.Spec.Units)
+	units[unit].Passes = true
+	return d.store.SetSpec(ctx, m.ID, Spec{Units: units})
 }
 
 // packet builds the WorkPacket for the current phase/iteration
@@ -646,8 +710,23 @@ func (d *Driver) packet(ctx context.Context, m Mission) (WorkPacket, error) {
 	}
 	return WorkPacket{
 		Goal: m.Goal, Kind: m.Kind, Spec: m.Spec, Progress: m.Progress,
-		GitLog: gitLog, Iteration: m.Iteration,
+		GitLog: gitLog, Iteration: m.Iteration, PromptOverlay: m.PromptOverlay,
+		ExecEnvironmentNote: execEnvironmentNote(d.sandboxExec != nil),
 	}, nil
+}
+
+// runVerify executes verify_cmd via the mission's sandbox container
+// when one is configured, or brain's own process otherwise — the
+// verify-side counterpart of nativeRunner routing shell/write_file
+// through the same backend.
+func (d *Driver) runVerify(ctx context.Context, missionID, workRoot, verifyCmd string) (VerifyResult, error) {
+	if d.sandboxExec == nil {
+		return RunVerify(ctx, workRoot, verifyCmd)
+	}
+	backend := func(ctx context.Context, workdir, command string, timeout time.Duration, out io.Writer) (int, error) {
+		return d.sandboxExec(ctx, missionID, workdir, command, timeout, out)
+	}
+	return RunVerifyWithBackend(ctx, backend, workRoot, verifyCmd)
 }
 
 func (d *Driver) recordProgress(ctx context.Context, id, text string) error {
