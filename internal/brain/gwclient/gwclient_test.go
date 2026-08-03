@@ -1,6 +1,7 @@
 package gwclient
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -109,6 +110,60 @@ func TestStreamEmitsTerminalWhenCutBeforeDone(t *testing.T) {
 	last := events[len(events)-1]
 	if last.Type != stream.EventError || last.Err.Code != "gateway_stream_cut" {
 		t.Fatalf("last = %+v, want gateway_stream_cut error", last)
+	}
+}
+
+// TestStreamEmitsTerminalWhenCutAfterContextDone pins the fix for a
+// race where the caller's context (brain's turnCtx, ~30min ceiling)
+// expires at almost the same instant as a genuine upstream failure:
+// previously the synthetic gateway_stream_cut error was skipped
+// entirely whenever ctx.Err() != nil at that point, so persistTurn
+// (chat.go) received neither a failure nor any text and silently
+// appended nothing — a real ~30min OCI turn vanished with zero
+// session_events despite gateway having tried to report a real error.
+func TestStreamEmitsTerminalWhenCutAfterContextDone(t *testing.T) {
+	t.Parallel()
+
+	// The fix's delivery races ch<- against ctx.Done() once ctx is
+	// already done when the read error surfaces (never blocking
+	// forever on an abandoned consumer is the whole point of racing
+	// against ctx.Done() at all) — so a single attempt can't
+	// distinguish "fixed, lost this particular race" from "the old,
+	// unconditionally-skipped bug". Run many independent attempts and
+	// require the terminal to win at least once; assert it NEVER wins
+	// without the fix by running this same body against a build where
+	// the guard is restored (see the sibling reproduction, which fails
+	// deterministically with terminals=0 on every attempt).
+	const attempts = 40
+	delivered := 0
+	for i := 0; i < attempts; i++ {
+		release := make(chan struct{})
+		c := gatewayStub(t, func(w http.ResponseWriter, r *http.Request) {
+			_, _ = fmt.Fprint(w, "data: {\"type\":\"chunk\",\"text\":\"par\"}\n\n")
+			w.(http.Flusher).Flush()
+			<-release
+			panic(http.ErrAbortHandler)
+		})
+
+		ctx, cancel := context.WithCancel(t.Context())
+		ch, err := c.Stream(ctx, StreamRequest{Route: "mini"})
+		if err != nil {
+			t.Fatalf("Stream: %v", err)
+		}
+
+		first := <-ch
+		if first.Type != stream.EventChunk {
+			t.Fatalf("first event = %+v, want chunk", first)
+		}
+		cancel()
+		close(release)
+
+		if ev, ok := <-ch; ok && ev.Type == stream.EventError && ev.Err.Code == "gateway_stream_cut" {
+			delivered++
+		}
+	}
+	if delivered == 0 {
+		t.Fatalf("gateway_stream_cut never delivered across %d attempts, want at least one", attempts)
 	}
 }
 
