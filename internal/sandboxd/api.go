@@ -49,6 +49,40 @@ const (
 // no mission-id-shaped input ever reaches a container name.
 var missionIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
+// D-053: per-exec env is deny-by-default — only names a detached
+// executor (headless claude CLI) actually needs ever reach the
+// container. Container-level Env (createContainer) stays PATH+HOME
+// only; this allowlist governs solely the per-exec addition.
+var execEnvAllowlist = map[string]bool{
+	"ANTHROPIC_API_KEY":       true,
+	"ANTHROPIC_AUTH_TOKEN":    true,
+	"ANTHROPIC_BASE_URL":      true,
+	"ANTHROPIC_MODEL":         true,
+	"CLAUDE_CODE_OAUTH_TOKEN": true,
+	"NO_COLOR":                true,
+	"TERM":                    true,
+}
+
+// execEnvMaxValueLen bounds a single env value — generous for a token
+// or URL, small enough that this can never become a payload smuggling
+// channel.
+const execEnvMaxValueLen = 4096
+
+// validExecEnv rejects any name outside execEnvAllowlist or any value
+// over execEnvMaxValueLen, returning the offending name only — the
+// value itself must never be logged or echoed back to the caller.
+func validExecEnv(env map[string]string) (badName string, ok bool) {
+	for name, value := range env {
+		if !execEnvAllowlist[name] {
+			return name, false
+		}
+		if len(value) > execEnvMaxValueLen {
+			return name, false
+		}
+	}
+	return "", true
+}
+
 // Config bounds the two things this service must cap regardless of
 // what a caller asks for: concurrent execs (a slow/hung command must
 // not let an unbounded number pile up) and live containers (a runaway
@@ -115,9 +149,33 @@ func validWorkdir(w string) bool {
 }
 
 type execRequest struct {
-	Workdir        string `json:"workdir"`
-	Command        string `json:"command"`
-	TimeoutSeconds int    `json:"timeout_seconds"`
+	Workdir        string            `json:"workdir"`
+	Command        string            `json:"command"`
+	TimeoutSeconds int               `json:"timeout_seconds"`
+	Env            map[string]string `json:"env,omitempty"`
+	// Environment selects the mission's sandbox image (D-05x) — a key
+	// into manager.go's environmentImages allowlist, never a free-form
+	// image string. "" and "base" both mean the configured base image.
+	// Only matters on a mission's first exec (image is fixed once its
+	// container is created); a later exec sends whatever the mission
+	// row still carries, which validExecEnvironment accepts even if it
+	// no longer matches the running container — ensureContainer never
+	// re-resolves the image for an existing container.
+	Environment string `json:"environment,omitempty"`
+}
+
+// validExecEnvironment rejects any environment key outside
+// manager.go's environmentImages allowlist (plus the "" and "base"
+// aliases for the base image) — same shape as validExecEnv's D-053
+// allowlist check, checked before the exec ever reaches Docker so an
+// unrecognized key is a clean 400, not a mid-stream infra error.
+func validExecEnvironment(environment string) bool {
+	switch environment {
+	case "", "base":
+		return true
+	default:
+		return environmentImages[environment] != ""
+	}
 }
 
 // handleExec streams command's combined stdout+stderr as SSE. Pre-stream
@@ -145,6 +203,14 @@ func (a *API) handleExec(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.TrimSpace(req.Command) == "" {
 		jsonError(w, http.StatusBadRequest, "bad_request", "command is required")
+		return
+	}
+	if badName, ok := validExecEnv(req.Env); !ok {
+		jsonError(w, http.StatusBadRequest, "bad_request", "env var not allowed: "+badName)
+		return
+	}
+	if !validExecEnvironment(req.Environment) {
+		jsonError(w, http.StatusBadRequest, "bad_request", fmt.Sprintf("unknown environment %q", req.Environment))
 		return
 	}
 	timeout := time.Duration(req.TimeoutSeconds) * time.Second
@@ -184,7 +250,7 @@ func (a *API) handleExec(w http.ResponseWriter, r *http.Request) {
 	ctrl := http.NewResponseController(w)
 	out := &sseOutputWriter{w: w, flusher: flusher, ctrl: ctrl}
 
-	exitCode, err := a.mgr.Exec(r.Context(), missionID, req.Workdir, req.Command, timeout, out)
+	exitCode, err := a.mgr.ExecEnv(r.Context(), missionID, req.Environment, req.Workdir, req.Command, req.Env, timeout, out)
 	switch {
 	case err != nil && errors.Is(err, ErrTimeout):
 		writeEvent(w, flusher, "error", map[string]any{

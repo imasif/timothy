@@ -30,12 +30,29 @@ import {
   DialogTitle,
 } from '../components/ui/dialog'
 import { ModelBadge } from '../components/ModelBadge'
+import { ClaudeCodeIcon } from '../components/icons/ClaudeCodeIcon'
 import { Badge } from '../components/ui/badge'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../components/ui/tooltip'
 import { errText } from '../components/settings/util'
 import { describeCron } from '../lib/schedules'
 import { playAlertSound } from '../lib/alertSound'
 import { subscribeEvents } from '../lib/events'
 import { compact, formatDuration, money } from '../lib/format'
+
+// notionalTooltipLine formats the "≈$X subscription (not billed)" line
+// for the billed cost pill's tooltip, in that pill's OWN currency only
+// — prefers the currency-converted notional amount (matching the
+// pill's display currency), falling back to the raw notional amount in
+// that same currency if no converted figure exists for it. null when
+// neither map has an entry for currency, which also covers the
+// all-billed mission with no notional spend at all.
+function notionalTooltipLine(usage: MissionUsage, currency: string): string | null {
+  const converted = usage.converted_notional_cost_by_currency?.[currency]
+  const raw = usage.notional_cost_by_currency?.[currency]
+  const amount = converted ?? raw
+  if (amount == null) return null
+  return `≈${money(amount, currency)} subscription (not billed)`
+}
 
 function formatDate(v?: string): string {
   if (!v) return 'N/A'
@@ -63,6 +80,65 @@ function turnStats(events: MissionEvent[]): { turns: number; processingMs: numbe
 
 const resumableStatuses = new Set(['paused', 'waiting_for_input'])
 const terminalPhases = new Set(['done', 'failed'])
+
+// latestExecutorProgress finds the most recent executor.progress event
+// so the phase header can show a lightweight live indicator — these
+// events fire on every byte the delegated CLI executor writes, far too
+// often to render as individual Timeline rows (TimelineSection drops
+// them), so only the latest one is surfaced here.
+function latestExecutorProgress(events: MissionEvent[]): { turns: number; tool_calls: number } | null {
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (events[i].kind === 'executor.progress') {
+      const { turns, tool_calls } = events[i].payload as { turns: number; tool_calls: number }
+      return { turns, tool_calls }
+    }
+  }
+  return null
+}
+
+// latestExecutorSpawn finds the most recent executor.spawned event, so
+// the stats row can name the delegated CLI that actually ran the work
+// — unlike the native session's model pill, this is a fact about what
+// ran and stays shown once the mission is terminal.
+function latestExecutorSpawn(
+  events: MissionEvent[],
+): { harness: string; provider: string; model: string } | null {
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (events[i].kind === 'executor.spawned') {
+      const { harness, provider, model } = events[i].payload as {
+        harness: string
+        provider: string
+        model: string
+      }
+      return { harness, provider, model }
+    }
+  }
+  return null
+}
+
+// harnessDisplayName maps a registered harness id to the label shown
+// in the pill — mirrors MissionForm's executorChoices labels.
+const harnessDisplayNames: Record<string, string> = {
+  'claude-cli': 'Claude Code',
+}
+
+function harnessDisplayName(harness: string): string {
+  return harnessDisplayNames[harness] ?? harness
+}
+
+// CostBadge renders the billed-cost pill: a plain Badge when there's
+// no notional (subscription) cost to note, or one wrapped in a Tooltip
+// showing that single line when there is.
+function CostBadge({ cost, currency, notionalLine }: { cost: number; currency: string; notionalLine: string | null }) {
+  const badge = <Badge variant="secondary">{money(cost, currency)}</Badge>
+  if (!notionalLine) return badge
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>{badge}</TooltipTrigger>
+      <TooltipContent>{notionalLine}</TooltipContent>
+    </Tooltip>
+  )
+}
 
 export function MissionDetail() {
   const { id } = useParams<{ id: string }>()
@@ -156,6 +232,8 @@ export function MissionDetail() {
   const canCancel = !terminalPhases.has(mission.phase)
 
   const { turns, processingMs } = turnStats(events)
+  const executorActivity = terminalPhases.has(mission.phase) ? null : latestExecutorProgress(events)
+  const executorSpawn = latestExecutorSpawn(events)
   // A live mission's elapsed span runs to now, not its last updated_at
   // (which only moves on a state transition, not while a turn is
   // in-flight) — otherwise "Elapsed" would understate a mission stuck
@@ -287,6 +365,12 @@ export function MissionDetail() {
               <span className="capitalize">{mission.kind}</span>
               <span>{mission.phase}</span>
               <span>{mission.status.replace(/_/g, ' ')}</span>
+              {executorActivity && (
+                <span>
+                  executor: {executorActivity.turns} turn{executorActivity.turns === 1 ? '' : 's'},{' '}
+                  {executorActivity.tool_calls} tool call{executorActivity.tool_calls === 1 ? '' : 's'}
+                </span>
+              )}
               {!terminalPhases.has(mission.phase) && mission.iteration > 0 && (
                 <span>Retries {mission.iteration}</span>
               )}
@@ -331,14 +415,30 @@ export function MissionDetail() {
         <div className="mt-3 flex flex-wrap items-center gap-1.5">
           {usage &&
             usage.requests > 0 &&
-            usage.models.map((m) => (
-              <ModelBadge
-                key={`${m.provider}:${m.model}`}
-                provider={m.provider}
-                model={m.model}
-                title={`${m.requests} call${m.requests === 1 ? '' : 's'} via ${m.provider}`}
-              />
-            ))}
+            usage.models
+              .filter((m) => !m.harness)
+              .map((m) => (
+                <ModelBadge
+                  key={`${m.provider}:${m.model}`}
+                  provider={m.provider}
+                  model={`brain · ${m.model}`}
+                  title={`${m.requests} call${m.requests === 1 ? '' : 's'} via ${m.provider}`}
+                />
+              ))}
+          {executorSpawn && (
+            <Badge
+              variant="secondary"
+              title={`Delegated CLI executor that ran this mission's coding work, via ${executorSpawn.provider}`}
+            >
+              <ClaudeCodeIcon />
+              {harnessDisplayName(executorSpawn.harness)} · {executorSpawn.model}
+            </Badge>
+          )}
+          {mission.environment && (
+            <Badge variant="secondary" title="Sandbox environment this mission's container runs">
+              env · {mission.environment}
+            </Badge>
+          )}
           {usage && usage.requests > 0 && (
             <Badge variant="secondary">
               {compact(usage.input_tokens)}→{compact(usage.output_tokens)} tok
@@ -351,27 +451,27 @@ export function MissionDetail() {
             total {formatDuration(elapsedMs)}
           </Badge>
           {usage && usage.requests > 0 && (
-            <>
+            <TooltipProvider>
               {usage.converted_cost_by_currency && Object.keys(usage.converted_cost_by_currency).length > 0 ? (
                 Object.entries(usage.converted_cost_by_currency).map(([currency, cost]) => (
-                  <Badge
+                  <CostBadge
                     key={currency}
-                    variant="secondary"
-                    title={`Converted from the billed amount(s) (${Object.entries(usage.cost_by_currency)
-                      .map(([c, v]) => money(v, c))
-                      .join(', ')}) using a stored exchange rate.`}
-                  >
-                    {money(cost, currency)}
-                  </Badge>
+                    cost={cost}
+                    currency={currency}
+                    notionalLine={notionalTooltipLine(usage, currency)}
+                  />
                 ))
               ) : (
                 Object.entries(usage.cost_by_currency).map(([currency, cost]) => (
-                  <Badge key={currency} variant="secondary">
-                    {money(cost, currency)}
-                  </Badge>
+                  <CostBadge
+                    key={currency}
+                    cost={cost}
+                    currency={currency}
+                    notionalLine={notionalTooltipLine(usage, currency)}
+                  />
                 ))
               )}
-            </>
+            </TooltipProvider>
           )}
           <Badge variant="secondary">
             {turns} turn{turns === 1 ? '' : 's'}

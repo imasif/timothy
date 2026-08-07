@@ -4,6 +4,8 @@ import {
   classifyMission,
   createMission,
   createSchedule,
+  type ExecutorOption,
+  getMissionExecutorOptions,
   getSettings,
   patchSchedule,
 } from '../../api/client'
@@ -34,7 +36,14 @@ const kindCopy: Record<Kind, string> = {
 // explicit undefined when unset (see types.ts) — "non-default" means
 // any of them, or a non-default agent, actually has a value.
 function hasNonDefaults(t: Schedule['mission_template']): boolean {
-  return !!(t.agent_id || t.route || t.review_route || t.budget_amount != null)
+  return !!(
+    t.agent_id ||
+    t.route ||
+    t.review_route ||
+    t.budget_amount != null ||
+    t.harness ||
+    t.environment
+  )
 }
 
 // Radix Select.Item rejects an empty string value, so the "no route
@@ -42,6 +51,36 @@ function hasNonDefaults(t: Schedule['mission_template']): boolean {
 // Select and the route/reviewRoute/escalationRoute state (which stay ''
 // to match the API's own empty-means-default semantics).
 const ROUTE_DEFAULT = '__default__'
+
+// Sentinel for the executor Select's "apply the settings default"
+// choice — wire value stays '' (omit harness from the create payload)
+// to match the API's own empty-means-default semantics.
+const EXECUTOR_DEFAULT = '__default__'
+
+// executorChoices maps a harness Select value to its label — easy to
+// extend as more harnesses register; claude-cli is the only one today.
+const executorChoices: { value: string; label: string }[] = [
+  { value: EXECUTOR_DEFAULT, label: 'Default (from settings)' },
+  { value: 'native', label: 'Native' },
+  { value: 'claude-cli', label: 'Claude Code' },
+]
+
+// Sentinel for the environment Select's "auto-detect" choice — wire
+// value stays '' (omit environment from the create payload) to match
+// the API's own empty-means-auto-detect semantics (D-05x).
+const ENVIRONMENT_AUTO = '__auto__'
+
+// environmentChoices maps an environment Select value to its label —
+// mirrors sandboxd's image allowlist (internal/sandboxd/manager.go).
+const environmentChoices: { value: string; label: string }[] = [
+  { value: ENVIRONMENT_AUTO, label: 'Auto-detect' },
+  { value: 'base', label: 'Base' },
+  { value: 'go', label: 'Go' },
+  { value: 'node', label: 'Node' },
+  { value: 'python', label: 'Python' },
+  { value: 'java', label: 'Java' },
+  { value: 'php', label: 'PHP' },
+]
 
 // expiresAt is stored as the wire-compatible 'YYYY-MM-DDTHH:mm' string the
 // API already expects; these split it into a Date (for the calendar) and a
@@ -111,7 +150,24 @@ export function MissionForm({
   const [budget, setBudget] = useState('')
   const [budgetCurrency, setBudgetCurrency] = useState('USD')
   const [autoApproveSafe, setAutoApproveSafe] = useState(true)
+  const [harness, setHarness] = useState('')
+  const [environment, setEnvironment] = useState('')
+  const [executorOptions, setExecutorOptions] = useState<ExecutorOption[] | null>(null)
   const [busy, setBusy] = useState(false)
+
+  // Live executor pairing/usability preview: coding-only, refetched
+  // whenever the kind flips to coding or the route selection changes.
+  // Best-effort — a failed fetch degrades to a plain, fully-enabled
+  // select with no live info, the server validates on submit anyway.
+  useEffect(() => {
+    if (kind !== 'coding') {
+      setExecutorOptions(null)
+      return
+    }
+    getMissionExecutorOptions(route || undefined)
+      .then(setExecutorOptions)
+      .catch(() => setExecutorOptions(null))
+  }, [kind, route])
 
   // Pre-select the settings page's configured default currency for a
   // fresh create — edit mode below overwrites this with the schedule's
@@ -164,6 +220,8 @@ export function MissionForm({
         : '',
     )
     setBudgetCurrency(schedule.mission_template.budget_currency || 'USD')
+    setHarness(schedule.mission_template.harness ?? '')
+    setEnvironment(schedule.mission_template.environment ?? '')
     setExpiresAt(schedule.expires_at ? schedule.expires_at.slice(0, 16) : '')
     setCronError(null)
   }, [mode, schedule])
@@ -255,6 +313,8 @@ export function MissionForm({
       budget_amount: budget ? Number(budget) : undefined,
       budget_currency: budget ? budgetCurrency : undefined,
       auto_approve_safe: autoApproveSafe,
+      harness: kind === 'coding' ? harness || undefined : undefined,
+      environment: kind === 'coding' ? environment || undefined : undefined,
     })
     toast.success('Mission created')
     onDone({ kind: 'mission', id })
@@ -274,6 +334,8 @@ export function MissionForm({
         budget_amount: budget ? Number(budget) : undefined,
         budget_currency: budget ? budgetCurrency : undefined,
         auto_approve_safe: autoApproveSafe,
+        harness: kind === 'coding' ? harness || undefined : undefined,
+        environment: kind === 'coding' ? environment || undefined : undefined,
       },
       expires_at: expiresAt ? new Date(expiresAt).toISOString() : undefined,
     })
@@ -296,6 +358,9 @@ export function MissionForm({
         budget_amount: budget ? Number(budget) : undefined,
         budget_currency: budget ? budgetCurrency : undefined,
         auto_approve_safe: autoApproveSafe,
+        harness: schedule.mission_template.kind === 'coding' ? harness || undefined : undefined,
+        environment:
+          schedule.mission_template.kind === 'coding' ? environment || undefined : undefined,
       },
       expires_at: expiresAt ? new Date(expiresAt).toISOString() : null,
     })
@@ -497,6 +562,70 @@ export function MissionForm({
                 {agents.map((a: AdminAgent) => (
                   <SelectItem key={a.id} value={a.id}>
                     {a.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        )}
+
+        {kind === 'coding' && (
+          <div className="space-y-1.5">
+            <Label htmlFor="mission-executor">Executor</Label>
+            <Select
+              value={harness || EXECUTOR_DEFAULT}
+              onValueChange={(v) => setHarness(v === EXECUTOR_DEFAULT ? '' : v)}
+            >
+              <SelectTrigger id="mission-executor" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {executorChoices.map((c) => {
+                  const opt = executorOptions?.find((o) => o.harness === c.value)
+                  const disabled = !!opt && !opt.usable
+                  return (
+                    <SelectItem
+                      key={c.value}
+                      value={c.value}
+                      disabled={disabled}
+                      title={disabled ? opt?.reason : undefined}
+                    >
+                      {c.label}
+                    </SelectItem>
+                  )
+                })}
+              </SelectContent>
+            </Select>
+            {(() => {
+              // executorOptions is keyed by real registered harness
+              // names only — "Default"/"Native" never have a match,
+              // so the preview only ever renders for a concretely
+              // selected harness (e.g. "claude-cli").
+              const selected = executorOptions?.find((o) => o.harness === harness)
+              if (!selected?.usable) return null
+              return (
+                <p className="text-xs text-muted-foreground">
+                  runs via {selected.provider_name}/{selected.model}
+                </p>
+              )
+            })()}
+          </div>
+        )}
+
+        {kind === 'coding' && (
+          <div className="space-y-1.5">
+            <Label htmlFor="mission-environment">Environment</Label>
+            <Select
+              value={environment || ENVIRONMENT_AUTO}
+              onValueChange={(v) => setEnvironment(v === ENVIRONMENT_AUTO ? '' : v)}
+            >
+              <SelectTrigger id="mission-environment" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {environmentChoices.map((c) => (
+                  <SelectItem key={c.value} value={c.value}>
+                    {c.label}
                   </SelectItem>
                 ))}
               </SelectContent>

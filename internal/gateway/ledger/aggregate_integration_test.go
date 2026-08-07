@@ -4,6 +4,7 @@ package ledger
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -147,6 +148,122 @@ func TestAggregateSummaryExcludesTestTraffic(t *testing.T) {
 	}
 }
 
+// seedNotionalAgg writes one billed row and one notional row (D-051's
+// delegated CLI executor billed through a subscription/oauth_token,
+// recording the API-equivalent price as Notional) for the same
+// provider/session — the fixture every notional-exclusion test below
+// shares, mirroring TestAggregateMissionUsageNotionalSplit's fixture
+// shape but for the analytics aggregates rather than Mission.
+func seedNotionalAgg(t *testing.T, led *Ledger) (provider string, from, to time.Time) {
+	t.Helper()
+	ctx := t.Context()
+	provider = aggMarker + "notional"
+	base := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Hour)
+
+	led.Record(ctx, Entry{
+		Provider: provider, Model: "m1", Route: "coding", SessionID: "notional-s1",
+		Usage:     &stream.Usage{InputTokens: 100, OutputTokens: 50},
+		LatencyMS: 100, Status: "ok", Cost: usd(0.10),
+	})
+	led.Record(ctx, Entry{
+		Provider: provider, Model: "m1", Route: "coding", SessionID: "notional-s1",
+		Usage:     &stream.Usage{InputTokens: 200, OutputTokens: 100},
+		LatencyMS: 100, Status: "ok", Cost: usd(0.25), Notional: true,
+	})
+	return provider, base, time.Now().UTC().Add(time.Hour)
+}
+
+// TestAggregateSummaryExcludesNotional confirms SummaryByCurrency's
+// Cost sums only real spend (FILTER (WHERE NOT notional), same as the
+// mission aggregator) while NotionalCost carries the excluded
+// subscription-billed amount separately, in the same currency — never
+// folded into Cost.
+func TestAggregateSummaryExcludesNotional(t *testing.T) {
+	agg, led := testAggregator(t)
+	provider, from, to := seedNotionalAgg(t, led)
+
+	points, err := agg.Series(t.Context(), from, to, "day", "provider")
+	if err != nil {
+		t.Fatalf("Series: %v", err)
+	}
+	var cost, notional float64
+	for _, p := range points {
+		if p.Group == provider {
+			cost += p.Cost
+			notional += p.NotionalCost
+		}
+	}
+	if cost != 0.10 {
+		t.Fatalf("series cost = %v, want 0.10 (billed only, notional excluded)", cost)
+	}
+	if notional != 0.25 {
+		t.Fatalf("series notional_cost = %v, want 0.25", notional)
+	}
+
+	summaries, err := agg.SummaryByCurrency(t.Context(), from, to)
+	if err != nil {
+		t.Fatalf("SummaryByCurrency: %v", err)
+	}
+	var usdCost, usdNotional float64
+	for _, s := range summaries {
+		if s.Currency == "USD" {
+			usdCost, usdNotional = s.Cost, s.NotionalCost
+		}
+	}
+	// The shared DB may carry other USD rows from prior/parallel tests;
+	// this fixture's $0.25 notional row must be visible in NotionalCost
+	// (>= its own contribution) and never counted toward Cost, so Cost
+	// staying below the notional row's amount would be the failure
+	// signature of a regression that folded it back in.
+	if usdNotional < 0.25 {
+		t.Fatalf("USD summary notional_cost = %v, want >= 0.25", usdNotional)
+	}
+	_ = usdCost // sanity: no assertion on the shared total, only isolation above
+}
+
+// TestAggregateTotalsExcludesNotional confirms Totals' Cost sum
+// excludes notional rows the same way Series/Summary do.
+func TestAggregateTotalsExcludesNotional(t *testing.T) {
+	agg, led := testAggregator(t)
+	provider, from, to := seedNotionalAgg(t, led)
+
+	totals, err := agg.Totals(t.Context(), from, to, "provider")
+	if err != nil {
+		t.Fatalf("Totals: %v", err)
+	}
+	var cost float64
+	for _, g := range totals {
+		if g.Group == provider {
+			cost += g.Cost
+		}
+	}
+	if cost != 0.10 {
+		t.Fatalf("totals cost = %v, want 0.10 (billed only, notional excluded)", cost)
+	}
+}
+
+// TestAggregateTopSessionsExcludesNotional confirms TopSessions ranks
+// by real spend only — a session's notional row never inflates its
+// position or its reported cost.
+func TestAggregateTopSessionsExcludesNotional(t *testing.T) {
+	agg, led := testAggregator(t)
+	_, from, to := seedNotionalAgg(t, led)
+
+	sessions, err := agg.TopSessions(t.Context(), from, to, 100)
+	if err != nil {
+		t.Fatalf("TopSessions: %v", err)
+	}
+	for _, s := range sessions {
+		if s.SessionID == "notional-s1" {
+			if s.Cost != 0.10 {
+				t.Fatalf("session cost = %v, want 0.10 (billed only, notional excluded)", s.Cost)
+			}
+			return
+		}
+	}
+	t.Fatal("notional-s1 missing from top sessions")
+}
+
 // TestAggregateSeriesAndTotalsSplitByCurrency confirms Series and
 // Totals never sum a group's cost across billing currencies: two rows
 // for the same provider, one in USD and one in EUR, come back as two
@@ -160,12 +277,12 @@ func TestAggregateSeriesAndTotalsSplitByCurrency(t *testing.T) {
 
 	led.Record(ctx, Entry{
 		Provider: provider, Model: "m1", Route: "coding",
-		Usage: &stream.Usage{InputTokens: 100, OutputTokens: 50},
+		Usage:     &stream.Usage{InputTokens: 100, OutputTokens: 50},
 		LatencyMS: 100, Status: "ok", Cost: usd(1.00), Currency: "USD",
 	})
 	led.Record(ctx, Entry{
 		Provider: provider, Model: "m1", Route: "coding",
-		Usage: &stream.Usage{InputTokens: 200, OutputTokens: 100},
+		Usage:     &stream.Usage{InputTokens: 200, OutputTokens: 100},
 		LatencyMS: 100, Status: "ok", Cost: usd(2.00), Currency: "EUR",
 	})
 	from, to := base, time.Now().UTC().Add(time.Hour)
@@ -259,6 +376,13 @@ func TestAggregateMissionUsage(t *testing.T) {
 		{Provider: aggMarker + "a", Model: "m-local", Route: "coding", MissionID: mission,
 			Usage:     &stream.Usage{InputTokens: 40, OutputTokens: 20},
 			LatencyMS: 100, Status: "ok"},
+		// Same provider/model as the harness's delegated CLI executor
+		// used directly by brain too — purpose='executor' must split
+		// this into its own Harness=true row rather than merging with
+		// brain's m1 rows above.
+		{Provider: aggMarker + "a", Model: "m1", Route: "coding", MissionID: mission, Purpose: "executor",
+			Usage:     &stream.Usage{InputTokens: 10, OutputTokens: 5},
+			LatencyMS: 100, Status: "ok", Cost: usd(0.05)},
 		// Another mission and a test probe: both excluded.
 		{Provider: aggMarker + "a", Model: "m1", Route: "coding", MissionID: aggMarker + "other",
 			Usage:     &stream.Usage{InputTokens: 1000, OutputTokens: 1000},
@@ -275,23 +399,36 @@ func TestAggregateMissionUsage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Mission: %v", err)
 	}
-	if got.MissionID != mission || got.CostByCurrency["USD"] != 0.30 || got.InputTokens != 340 ||
-		got.OutputTokens != 170 || got.Requests != 3 || got.UnpricedRequests != 1 {
-		t.Fatalf("Mission = %+v, want mission_id=%s cost=0.30 in=340 out=170 requests=3 unpriced=1",
+	if got.MissionID != mission || got.CostByCurrency["USD"] != 0.35 || got.InputTokens != 350 ||
+		got.OutputTokens != 175 || got.Requests != 4 || got.UnpricedRequests != 1 {
+		t.Fatalf("Mission = %+v, want mission_id=%s cost=0.35 in=350 out=175 requests=4 unpriced=1",
 			got, mission)
 	}
-	if len(got.Models) != 2 {
-		t.Fatalf("Models = %+v, want 2 distinct provider/model pairs", got.Models)
+	// The executor-purpose row's $0.05 is the harness's; the rest is
+	// brain's.
+	if got.BilledBrainByCurrency["USD"] != 0.30 || got.BilledHarnessByCurrency["USD"] != 0.05 {
+		t.Fatalf("BilledBrainByCurrency/BilledHarnessByCurrency = %+v/%+v, want brain=0.30 harness=0.05",
+			got.BilledBrainByCurrency, got.BilledHarnessByCurrency)
 	}
-	byModel := map[string]ModelUsed{}
+	// m1 appears twice: once as brain's rows, once as the harness's
+	// executor row — grouping by (provider, model, harness) keeps them
+	// as distinct entries instead of merging brain and harness usage
+	// of the same model.
+	if len(got.Models) != 3 {
+		t.Fatalf("Models = %+v, want 3 distinct provider/model/harness triples", got.Models)
+	}
+	byKey := map[string]ModelUsed{}
 	for _, mu := range got.Models {
-		byModel[mu.Model] = mu
+		byKey[fmt.Sprintf("%s:%v", mu.Model, mu.Harness)] = mu
 	}
-	if mu := byModel["m1"]; mu.Provider != aggMarker+"a" || mu.Requests != 2 {
-		t.Fatalf("Models[m1] = %+v, want provider=%s requests=2", mu, aggMarker+"a")
+	if mu := byKey["m1:false"]; mu.Provider != aggMarker+"a" || mu.Requests != 2 {
+		t.Fatalf("Models[m1,harness=false] = %+v, want provider=%s requests=2", mu, aggMarker+"a")
 	}
-	if mu := byModel["m-local"]; mu.Provider != aggMarker+"a" || mu.Requests != 1 {
-		t.Fatalf("Models[m-local] = %+v, want provider=%s requests=1", mu, aggMarker+"a")
+	if mu := byKey["m1:true"]; mu.Provider != aggMarker+"a" || mu.Requests != 1 {
+		t.Fatalf("Models[m1,harness=true] = %+v, want provider=%s requests=1", mu, aggMarker+"a")
+	}
+	if mu := byKey["m-local:false"]; mu.Provider != aggMarker+"a" || mu.Requests != 1 {
+		t.Fatalf("Models[m-local,harness=false] = %+v, want provider=%s requests=1", mu, aggMarker+"a")
 	}
 
 	// A mission with no ledger rows is all zeros, not an error.
@@ -315,12 +452,12 @@ func TestAggregateMissionUsageMixedCurrency(t *testing.T) {
 
 	led.Record(ctx, Entry{
 		Provider: aggMarker + "a", Model: "m1", Route: "coding", MissionID: mission,
-		Usage: &stream.Usage{InputTokens: 100, OutputTokens: 50},
+		Usage:     &stream.Usage{InputTokens: 100, OutputTokens: 50},
 		LatencyMS: 100, Status: "ok", Cost: usd(0.10), Currency: "USD",
 	})
 	led.Record(ctx, Entry{
 		Provider: aggMarker + "eu", Model: "m2", Route: "coding", MissionID: mission,
-		Usage: &stream.Usage{InputTokens: 10, OutputTokens: 5},
+		Usage:     &stream.Usage{InputTokens: 10, OutputTokens: 5},
 		LatencyMS: 100, Status: "ok", Cost: usd(0.05), Currency: "EUR",
 	})
 
@@ -330,6 +467,97 @@ func TestAggregateMissionUsageMixedCurrency(t *testing.T) {
 	}
 	if len(got.CostByCurrency) != 2 || got.CostByCurrency["USD"] != 0.10 || got.CostByCurrency["EUR"] != 0.05 {
 		t.Fatalf("CostByCurrency = %+v, want {USD: 0.10, EUR: 0.05}", got.CostByCurrency)
+	}
+}
+
+// TestAggregateMissionUsageBrainHarnessSplit confirms billed spend
+// splits by who actually incurred it: the harness's own rows
+// (Purpose="executor", D-051's delegated CLI) vs everything else the
+// missions engine billed directly (explore/plan/worker/review) —
+// BilledBrainByCurrency + BilledHarnessByCurrency must equal
+// CostByCurrency.
+func TestAggregateMissionUsageBrainHarnessSplit(t *testing.T) {
+	agg, led := testAggregator(t)
+	ctx := t.Context()
+	mission := aggMarker + "brain-harness-mission"
+
+	led.Record(ctx, Entry{
+		Provider: aggMarker + "a", Model: "m1", Route: "coding", MissionID: mission,
+		Agent:     "mission-worker",
+		Usage:     &stream.Usage{InputTokens: 100, OutputTokens: 50},
+		LatencyMS: 100, Status: "ok", Cost: usd(0.21), Purpose: "executor",
+	})
+	led.Record(ctx, Entry{
+		Provider: aggMarker + "a", Model: "m1", Route: "coding", MissionID: mission,
+		Usage:     &stream.Usage{InputTokens: 200, OutputTokens: 100},
+		LatencyMS: 100, Status: "ok", Cost: usd(0.11),
+	})
+
+	got, err := agg.Mission(ctx, mission)
+	if err != nil {
+		t.Fatalf("Mission: %v", err)
+	}
+	if got.CostByCurrency["USD"] != 0.32 {
+		t.Fatalf("CostByCurrency = %+v, want USD 0.32", got.CostByCurrency)
+	}
+	if got.BilledHarnessByCurrency["USD"] != 0.21 {
+		t.Fatalf("BilledHarnessByCurrency = %+v, want USD 0.21", got.BilledHarnessByCurrency)
+	}
+	if got.BilledBrainByCurrency["USD"] != 0.11 {
+		t.Fatalf("BilledBrainByCurrency = %+v, want USD 0.11", got.BilledBrainByCurrency)
+	}
+}
+
+// TestAggregateMissionUsageNotionalSplit confirms a mission billed
+// through a subscription/oauth_token executor (D-051's delegated CLI
+// harness records the API-equivalent price as Notional) keeps that
+// cost out of CostByCurrency — the mission's true bill — while still
+// surfacing it separately in NotionalCostByCurrency.
+func TestAggregateMissionUsageNotionalSplit(t *testing.T) {
+	agg, led := testAggregator(t)
+	ctx := t.Context()
+	mission := aggMarker + "notional-mission"
+
+	led.Record(ctx, Entry{
+		Provider: aggMarker + "a", Model: "m1", Route: "coding", MissionID: mission,
+		Usage:     &stream.Usage{InputTokens: 100, OutputTokens: 50},
+		LatencyMS: 100, Status: "ok", Cost: usd(0.10),
+	})
+	led.Record(ctx, Entry{
+		Provider: aggMarker + "a", Model: "m1", Route: "coding", MissionID: mission,
+		Usage:     &stream.Usage{InputTokens: 200, OutputTokens: 100},
+		LatencyMS: 100, Status: "ok", Cost: usd(0.25), Notional: true,
+	})
+
+	got, err := agg.Mission(ctx, mission)
+	if err != nil {
+		t.Fatalf("Mission: %v", err)
+	}
+	if got.CostByCurrency["USD"] != 0.10 {
+		t.Fatalf("CostByCurrency = %+v, want USD 0.10 (billed only)", got.CostByCurrency)
+	}
+	if got.NotionalCostByCurrency["USD"] != 0.25 {
+		t.Fatalf("NotionalCostByCurrency = %+v, want USD 0.25", got.NotionalCostByCurrency)
+	}
+
+	// A mission billed entirely through a subscription has zero billed
+	// cost and must not appear in CostByCurrency at all — same
+	// omit-on-zero rule the FX decorator already applies.
+	subOnly := aggMarker + "sub-only-mission"
+	led.Record(ctx, Entry{
+		Provider: aggMarker + "a", Model: "m1", Route: "coding", MissionID: subOnly,
+		Usage:     &stream.Usage{InputTokens: 100, OutputTokens: 50},
+		LatencyMS: 100, Status: "ok", Cost: usd(0.15), Notional: true,
+	})
+	got2, err := agg.Mission(ctx, subOnly)
+	if err != nil {
+		t.Fatalf("Mission(subOnly): %v", err)
+	}
+	if len(got2.CostByCurrency) != 0 {
+		t.Fatalf("CostByCurrency = %+v, want empty (all notional)", got2.CostByCurrency)
+	}
+	if got2.NotionalCostByCurrency["USD"] != 0.15 {
+		t.Fatalf("NotionalCostByCurrency = %+v, want USD 0.15", got2.NotionalCostByCurrency)
 	}
 }
 

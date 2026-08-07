@@ -3,6 +3,7 @@ package sandboxd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -41,7 +42,7 @@ func writeJSON(t *testing.T, w http.ResponseWriter, status int, v any) {
 }
 
 func newTestManager(cli *client.Client) *Manager {
-	return &Manager{cli: cli, image: "img", locks: map[string]*sync.Mutex{}}
+	return &Manager{cli: cli, baseImage: "img", locks: map[string]*sync.Mutex{}}
 }
 
 func TestResolveWorkspaceMountVolume(t *testing.T) {
@@ -111,7 +112,7 @@ func TestEnsureContainerRunningReusesInPlace(t *testing.T) {
 		}
 	})
 	mgr := newTestManager(cli)
-	id, err := mgr.ensureContainer(context.Background(), "m1")
+	id, err := mgr.ensureContainer(context.Background(), "m1", "")
 	if err != nil {
 		t.Fatalf("ensureContainer: %v", err)
 	}
@@ -140,7 +141,7 @@ func TestEnsureContainerExitedRestarts(t *testing.T) {
 		}
 	})
 	mgr := newTestManager(cli)
-	id, err := mgr.ensureContainer(context.Background(), "m1")
+	id, err := mgr.ensureContainer(context.Background(), "m1", "")
 	if err != nil {
 		t.Fatalf("ensureContainer: %v", err)
 	}
@@ -194,7 +195,7 @@ func TestEnsureContainerNotFoundCreates(t *testing.T) {
 	})
 	mgr := newTestManager(cli)
 	mgr.workspaceMount = mount.Mount{Type: mount.TypeVolume, Source: "timothy_workspace", Target: workspaceMountPath}
-	id, err := mgr.ensureContainer(context.Background(), "m1")
+	id, err := mgr.ensureContainer(context.Background(), "m1", "")
 	if err != nil {
 		t.Fatalf("ensureContainer: %v", err)
 	}
@@ -230,12 +231,163 @@ func TestEnsureContainerCreateConflictReinspects(t *testing.T) {
 	})
 	mgr := newTestManager(cli)
 	mgr.workspaceMount = mount.Mount{Type: mount.TypeVolume, Source: "timothy_workspace", Target: workspaceMountPath}
-	id, err := mgr.ensureContainer(context.Background(), "m1")
+	id, err := mgr.ensureContainer(context.Background(), "m1", "")
 	if err != nil {
 		t.Fatalf("ensureContainer: %v", err)
 	}
 	if id != "sibling1" {
 		t.Fatalf("id = %q, want sibling1 (the container the racing sibling created)", id)
+	}
+}
+
+// TestResolveMountStateVolume confirms resolveMount generalizes to
+// D-054's state-volume lookup (keyed on stateVolumeMetaPath) the same
+// way it already resolves the workspace mount.
+func TestResolveMountStateVolume(t *testing.T) {
+	cli := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, http.StatusOK, container.InspectResponse{
+			ID: "self",
+			Mounts: []container.MountPoint{
+				{Type: mount.TypeVolume, Name: "timothy_executor-claude-state", Destination: stateVolumeMetaPath},
+			},
+		})
+	})
+
+	m, err := resolveMount(context.Background(), cli, stateVolumeMetaPath, executorStateMountPath)
+	if err != nil {
+		t.Fatalf("resolveMount: %v", err)
+	}
+	if m.Source != "timothy_executor-claude-state" || m.Target != executorStateMountPath {
+		t.Fatalf("mount = %+v, want source=timothy_executor-claude-state target=%s", m, executorStateMountPath)
+	}
+}
+
+// TestCreateContainerIncludesStateMountWhenPresent confirms a
+// configured state mount is added (rw) to every mission container.
+func TestCreateContainerIncludesStateMountWhenPresent(t *testing.T) {
+	var gotMounts []mount.Mount
+	cli := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1.51/containers/create":
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read create body: %v", err)
+			}
+			var cfg struct {
+				HostConfig container.HostConfig
+			}
+			if err := json.Unmarshal(body, &cfg); err != nil {
+				t.Fatalf("unmarshal create body: %v", err)
+			}
+			gotMounts = cfg.HostConfig.Mounts
+			writeJSON(t, w, http.StatusCreated, container.CreateResponse{ID: "new1"})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1.51/containers/new1/start":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected call: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	mgr := newTestManager(cli)
+	mgr.workspaceMount = mount.Mount{Type: mount.TypeVolume, Source: "timothy_workspace", Target: workspaceMountPath}
+	mgr.stateMount = mount.Mount{Type: mount.TypeVolume, Source: "timothy_executor-claude-state", Target: executorStateMountPath}
+
+	if _, err := mgr.createContainer(context.Background(), "m1", "timothy-sandbox-m1", ""); err != nil {
+		t.Fatalf("createContainer: %v", err)
+	}
+	if len(gotMounts) != 2 {
+		t.Fatalf("create body: Mounts = %+v, want 2 (workspace + state)", gotMounts)
+	}
+	found := false
+	for _, m := range gotMounts {
+		if m.Target == executorStateMountPath && m.Source == "timothy_executor-claude-state" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("create body: Mounts = %+v, want one at %s", gotMounts, executorStateMountPath)
+	}
+}
+
+// TestCreateContainerOmitsStateMountWhenAbsent confirms a container is
+// still created successfully (no state mount) when the operator hasn't
+// configured the volume — missions on API-key auth must keep working.
+func TestCreateContainerOmitsStateMountWhenAbsent(t *testing.T) {
+	var gotMounts []mount.Mount
+	cli := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1.51/containers/create":
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read create body: %v", err)
+			}
+			var cfg struct {
+				HostConfig container.HostConfig
+			}
+			if err := json.Unmarshal(body, &cfg); err != nil {
+				t.Fatalf("unmarshal create body: %v", err)
+			}
+			gotMounts = cfg.HostConfig.Mounts
+			writeJSON(t, w, http.StatusCreated, container.CreateResponse{ID: "new1"})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1.51/containers/new1/start":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected call: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	mgr := newTestManager(cli)
+	mgr.workspaceMount = mount.Mount{Type: mount.TypeVolume, Source: "timothy_workspace", Target: workspaceMountPath}
+	// mgr.stateMount left zero-value: not configured.
+
+	if _, err := mgr.createContainer(context.Background(), "m1", "timothy-sandbox-m1", ""); err != nil {
+		t.Fatalf("createContainer: %v", err)
+	}
+	if len(gotMounts) != 1 || gotMounts[0].Target != workspaceMountPath {
+		t.Fatalf("create body: Mounts = %+v, want exactly [workspace]", gotMounts)
+	}
+}
+
+// TestImageFor covers D-05x's environment->image resolution: the
+// allowlist in environmentImages is the ONLY source of a variant image
+// tag; "" and "base" both resolve to the operator-configured base
+// image; anything else unrecognized is a loud error, never a silent
+// fallback.
+func TestImageFor(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		environment string
+		want        string
+		wantErr     bool
+	}{
+		{environment: "", want: "timothy-sandbox-base:latest"},
+		{environment: "base", want: "timothy-sandbox-base:latest"},
+		{environment: "go", want: "timothy-sandbox-go:latest"},
+		{environment: "node", want: "timothy-sandbox-node:latest"},
+		{environment: "python", want: "timothy-sandbox-python:latest"},
+		{environment: "java", want: "timothy-sandbox-java:latest"},
+		{environment: "php", want: "timothy-sandbox-php:latest"},
+		{environment: "ruby", wantErr: true},
+		{environment: "timothy-sandbox-go:latest", wantErr: true}, // an image string, not a key
+	}
+	for _, tc := range cases {
+		t.Run(tc.environment, func(t *testing.T) {
+			t.Parallel()
+			got, err := imageFor("timothy-sandbox-base:latest", tc.environment)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("imageFor(%q) = %q, nil, want an error", tc.environment, got)
+				}
+				if !errors.Is(err, ErrUnknownEnvironment) {
+					t.Errorf("imageFor(%q) error = %v, want ErrUnknownEnvironment", tc.environment, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("imageFor(%q): %v", tc.environment, err)
+			}
+			if got != tc.want {
+				t.Errorf("imageFor(%q) = %q, want %q", tc.environment, got, tc.want)
+			}
+		})
 	}
 }
 

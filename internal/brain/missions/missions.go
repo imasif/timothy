@@ -58,7 +58,20 @@ type Mission struct {
 	// to after a worker failure or review rework — instead of burning
 	// iterations on a model that already proved too weak for the unit.
 	// Empty disables escalation.
-	EscalationRoute   string `json:"escalation_route,omitempty"`
+	EscalationRoute string `json:"escalation_route,omitempty"`
+	// Harness is the execution strategy for this mission's worker turns,
+	// snapshotted at create time (D-051): "" is native in-process
+	// dispatch, "claude-cli" (etc) names a registered delegated executor
+	// (internal/brain/missions/executor). Coding-only; a general mission
+	// always runs native.
+	Harness string `json:"harness,omitempty"`
+	// Environment selects the per-language sandbox image (D-05x) a
+	// coding mission's container runs: "" is the base image. Unlike
+	// Harness, there is no settings default — precedence is explicit
+	// request -> auto-detect from repo markers at provisioning ->
+	// base. Sticky once set (Store.SetEnvironment), never re-detected.
+	// General missions never set this.
+	Environment       string `json:"environment,omitempty"`
 	PendingPermission string `json:"pending_permission,omitempty"`
 	// PendingPermissionTool/Args/Danger/Rationale describe the parked
 	// tool call for the UI — set alongside PendingPermission whenever a

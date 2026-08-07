@@ -64,7 +64,8 @@ const scoredRoute: AdminRoute = {
   serving: { provider_id: 'p2', model: 'grok-4' },
 }
 
-function renderRoute(name: string) {
+function renderRoute(name: string, override?: AdminRoute) {
+  if (override) vi.mocked(listRoutes).mockResolvedValue([override, scoredRoute])
   return render(
     <MemoryRouter initialEntries={[`/settings/routes/${name}`]}>
       <Routes>
@@ -80,6 +81,8 @@ beforeEach(() => {
   vi.mocked(listRoutes).mockResolvedValue([orderedRoute, scoredRoute])
   vi.mocked(listProviders).mockResolvedValue(providers)
   vi.mocked(patchRoute).mockResolvedValue(undefined)
+  // jsdom lacks scrollIntoView; Radix Select calls it on open.
+  Element.prototype.scrollIntoView = vi.fn()
 })
 
 describe('RouteEdit ordered pipeline', () => {

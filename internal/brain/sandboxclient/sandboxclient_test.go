@@ -3,7 +3,9 @@ package sandboxclient
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -32,7 +34,7 @@ func TestExecDecodesOutputChunksInOrder(t *testing.T) {
 	})
 
 	var out bytes.Buffer
-	code, err := c.Exec(t.Context(), "m1", "/workspace", "echo hi", 0, &out)
+	code, err := c.Exec(t.Context(), "m1", "", "/workspace", "echo hi", 0, &out)
 	if err != nil {
 		t.Fatalf("Exec: %v", err)
 	}
@@ -54,12 +56,61 @@ func TestExecNonZeroExitIsNotAnError(t *testing.T) {
 	})
 
 	var out bytes.Buffer
-	code, err := c.Exec(t.Context(), "m1", "/workspace", "exit 7", 0, &out)
+	code, err := c.Exec(t.Context(), "m1", "", "/workspace", "exit 7", 0, &out)
 	if err != nil {
 		t.Fatalf("Exec: %v", err)
 	}
 	if code != 7 {
 		t.Errorf("exit code = %d, want 7", code)
+	}
+}
+
+func TestExecOmitsEnvField(t *testing.T) {
+	t.Parallel()
+	var gotBody string
+	c := sandboxdStub(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, "event: exit\ndata: {\"exit_code\":0}\n\n")
+		w.(http.Flusher).Flush()
+	})
+
+	var out bytes.Buffer
+	if _, err := c.Exec(t.Context(), "m1", "", "/workspace", "true", 0, &out); err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if strings.Contains(gotBody, "\"env\"") {
+		t.Errorf("request body = %q, want no env field when Exec is called without one", gotBody)
+	}
+}
+
+func TestExecEnvMarshalsEnvField(t *testing.T) {
+	t.Parallel()
+	var gotBody string
+	c := sandboxdStub(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, "event: exit\ndata: {\"exit_code\":0}\n\n")
+		w.(http.Flusher).Flush()
+	})
+
+	var out bytes.Buffer
+	env := map[string]string{"ANTHROPIC_API_KEY": "sk-test"}
+	if _, err := c.ExecEnv(t.Context(), "m1", "", "/workspace", "true", env, 0, &out); err != nil {
+		t.Fatalf("ExecEnv: %v", err)
+	}
+	var decoded struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal([]byte(gotBody), &decoded); err != nil {
+		t.Fatalf("decode request body: %v", err)
+	}
+	if decoded.Env["ANTHROPIC_API_KEY"] != "sk-test" {
+		t.Errorf("request env = %+v, want ANTHROPIC_API_KEY=sk-test", decoded.Env)
 	}
 }
 
@@ -73,7 +124,7 @@ func TestExecTimeoutErrorMessage(t *testing.T) {
 	})
 
 	var out bytes.Buffer
-	code, err := c.Exec(t.Context(), "m1", "/workspace", "sleep 5", 0, &out)
+	code, err := c.Exec(t.Context(), "m1", "", "/workspace", "sleep 5", 0, &out)
 	if err == nil {
 		t.Fatal("Exec: want a timeout error, got nil")
 	}
@@ -97,7 +148,7 @@ func TestExecStreamCutWithoutTerminalIsInfraError(t *testing.T) {
 	})
 
 	var out bytes.Buffer
-	if _, err := c.Exec(t.Context(), "m1", "/workspace", "cmd", 0, &out); err == nil {
+	if _, err := c.Exec(t.Context(), "m1", "", "/workspace", "cmd", 0, &out); err == nil {
 		t.Fatal("Exec: want an error when the stream ends without a terminal event, got nil")
 	}
 }
@@ -109,7 +160,7 @@ func TestExecNon200IsInfraError(t *testing.T) {
 	})
 
 	var out bytes.Buffer
-	if _, err := c.Exec(t.Context(), "not-a-uuid", "/workspace", "cmd", 0, &out); err == nil {
+	if _, err := c.Exec(t.Context(), "not-a-uuid", "", "/workspace", "cmd", 0, &out); err == nil {
 		t.Fatal("Exec: want an error for a non-200 sandboxd response, got nil")
 	}
 }

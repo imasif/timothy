@@ -218,6 +218,40 @@ func TestMissionPromptOverlayRoundTrips(t *testing.T) {
 	}
 }
 
+// TestMissionHarnessRoundTrips covers D-051: harness is a first-class
+// column snapshotted at create time, same shape as PromptOverlay above
+// — "" (native) is the default when a mission omits it.
+func TestMissionHarnessRoundTrips(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+
+	id, err := s.Create(ctx, Mission{
+		Goal: marker + "harness", Kind: "coding", Route: "default", Harness: "claude-cli",
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	m, err := s.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if m.Harness != "claude-cli" {
+		t.Fatalf("Harness = %q, want claude-cli", m.Harness)
+	}
+
+	id2, err := s.Create(ctx, Mission{Goal: marker + "no-harness", Kind: "general", Route: "default"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	m2, err := s.Get(ctx, id2)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if m2.Harness != "" {
+		t.Fatalf("Harness = %q, want empty (native) when not set", m2.Harness)
+	}
+}
+
 func TestSetAndClearPendingPermission(t *testing.T) {
 	s := testStore(t)
 	ctx := t.Context()
@@ -538,12 +572,16 @@ func TestClaimWorkSlotConcurrencyCap(t *testing.T) {
 		t.Fatalf("claimed %d slots, want exactly %d (cap %d minus %d already working)", len(got), want, max, baseline)
 	}
 
+	// ClaimWorkSlot takes the oldest idle mission GLOBALLY, so in a
+	// shared database an older foreign idle row may be claimed instead
+	// of this test's fixtures — the invariant under test is the global
+	// cap, not which rows filled the slots.
 	var working int
-	if err := db.QueryRow(ctx, `SELECT count(*) FROM missions WHERE status = 'working' AND goal LIKE $1 || '%'`, marker).Scan(&working); err != nil {
+	if err := db.QueryRow(ctx, `SELECT count(*) FROM missions WHERE status = 'working'`).Scan(&working); err != nil {
 		t.Fatalf("count working: %v", err)
 	}
-	if working != want {
-		t.Fatalf("working count = %d, want %d", working, want)
+	if working != baseline+want {
+		t.Fatalf("working count = %d, want %d (baseline %d + claimed %d)", working, baseline+want, baseline, want)
 	}
 }
 
@@ -678,5 +716,40 @@ func TestRecoverStaleWorking(t *testing.T) {
 	}
 	if byID[freshID] {
 		t.Fatal("RecoverStaleWorking incorrectly returned a fresh working mission")
+	}
+}
+
+func TestSpendExcludesNotionalRows(t *testing.T) {
+	s := testStore(t)
+	ctx := t.Context()
+	id, err := s.Create(ctx, Mission{Goal: marker + "spend-notional", Kind: "general", Route: "default"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	db, err := s.db.Get()
+	if err != nil {
+		t.Fatalf("db: %v", err)
+	}
+	for _, row := range []struct {
+		cost     float64
+		notional bool
+	}{{0.05, false}, {0.25, true}} {
+		if _, err := db.Exec(ctx, `INSERT INTO cost_ledger
+			(provider, model, route, latency_ms, status, cost, currency, purpose, mission_id, notional)
+			VALUES ('itest-provider', 'itest-model', 'itest', 1, 'ok', $1, 'USD', 'executor', $2, $3)`,
+			row.cost, id, row.notional); err != nil {
+			t.Fatalf("insert ledger row: %v", err)
+		}
+	}
+	t.Cleanup(func() {
+		_, _ = db.Exec(context.Background(), `DELETE FROM cost_ledger WHERE mission_id = $1`, id)
+	})
+
+	spend, err := s.Spend(ctx, id)
+	if err != nil {
+		t.Fatalf("Spend: %v", err)
+	}
+	if got := spend.ByCurrency["USD"]; got != 0.05 {
+		t.Fatalf("Spend USD = %v, want 0.05 (notional row must be excluded from the brake)", got)
 	}
 }

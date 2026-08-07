@@ -30,22 +30,27 @@ var buckets = map[string]string{"hour": "hour", "day": "day", "week": "week"}
 var groups = map[string]string{
 	"provider": "provider",
 	"model":    "model",
-	"route": "route",
+	"route":    "route",
 }
 
 const notTest = `purpose IS DISTINCT FROM 'test'`
 
 // Summary is the header-tile answer: totals for a range, in one
-// currency. Unpriced fields count rows where cost is NULL (D-013:
-// unknown price is recorded as NULL, never guessed) — without them,
-// unpriced usage is invisible because SUM(cost) silently treats NULL
-// as free. A range spanning more than one billing currency comes back
-// as multiple Summary rows (one per currency) from SummaryByCurrency —
-// summing across them would mix currencies, which this package never
-// does.
+// currency. Cost excludes notional rows (subscription/oauth_token
+// executor runs, D-051) via FILTER (WHERE NOT notional) — same as the
+// mission aggregator — so it stays the range's true bill; NotionalCost
+// carries what that excluded spend would have cost at metered API
+// prices, same currency as Cost, never folded into it. Unpriced fields
+// count rows where cost is NULL (D-013: unknown price is recorded as
+// NULL, never guessed) — without them, unpriced usage is invisible
+// because SUM(cost) silently treats NULL as free. A range spanning more
+// than one billing currency comes back as multiple Summary rows (one
+// per currency) from SummaryByCurrency — summing across them would mix
+// currencies, which this package never does.
 type Summary struct {
 	Currency             string  `json:"currency"`
 	Cost                 float64 `json:"cost"`
+	NotionalCost         float64 `json:"notional_cost"`
 	InputTokens          int64   `json:"input_tokens"`
 	OutputTokens         int64   `json:"output_tokens"`
 	CacheReadTokens      int64   `json:"cache_read_tokens"`
@@ -65,7 +70,8 @@ func (a *Aggregator) SummaryByCurrency(ctx context.Context, from, to time.Time) 
 		return nil, fmt.Errorf("usage summary: %w", err)
 	}
 	rows, err := db.Query(ctx, `SELECT currency,
-			COALESCE(SUM(cost), 0),
+			COALESCE(SUM(cost) FILTER (WHERE NOT notional), 0),
+			COALESCE(SUM(cost) FILTER (WHERE notional), 0),
 			COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
 			COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_write_tokens), 0),
 			COUNT(*), COUNT(*) FILTER (WHERE status = 'error'),
@@ -83,7 +89,7 @@ func (a *Aggregator) SummaryByCurrency(ctx context.Context, from, to time.Time) 
 	out := []Summary{}
 	for rows.Next() {
 		var s Summary
-		if err := rows.Scan(&s.Currency, &s.Cost, &s.InputTokens, &s.OutputTokens,
+		if err := rows.Scan(&s.Currency, &s.Cost, &s.NotionalCost, &s.InputTokens, &s.OutputTokens,
 			&s.CacheReadTokens, &s.CacheWriteTokens, &s.Requests, &s.Errors,
 			&s.UnpricedRequests, &s.UnpricedInputTokens, &s.UnpricedOutputTokens); err != nil {
 			return nil, fmt.Errorf("usage summary: %w", err)
@@ -94,15 +100,18 @@ func (a *Aggregator) SummaryByCurrency(ctx context.Context, from, to time.Time) 
 }
 
 // SeriesPoint is one (time bucket, group, currency) cell of a stacked
-// chart. Unpriced token sums (rows where cost is NULL) let the
-// dashboard estimate what unpriced usage would cost from its advisory
-// catalog — the estimate stays client-side, the server never guesses
-// (D-013).
+// chart. Cost excludes notional rows (FILTER (WHERE NOT notional), same
+// as Summary); NotionalCost carries that excluded spend's metered-price
+// equivalent, same currency, never folded into Cost. Unpriced token sums
+// (rows where cost is NULL) let the dashboard estimate what unpriced
+// usage would cost from its advisory catalog — the estimate stays
+// client-side, the server never guesses (D-013).
 type SeriesPoint struct {
 	Bucket               time.Time `json:"bucket"`
 	Group                string    `json:"group"`
 	Currency             string    `json:"currency"`
 	Cost                 float64   `json:"cost"`
+	NotionalCost         float64   `json:"notional_cost"`
 	InputTokens          int64     `json:"input_tokens"`
 	OutputTokens         int64     `json:"output_tokens"`
 	Requests             int64     `json:"requests"`
@@ -129,7 +138,8 @@ func (a *Aggregator) Series(ctx context.Context, from, to time.Time, bucket, gro
 	}
 	rows, err := db.Query(ctx, `SELECT
 			date_trunc('`+b+`', ts) AS bucket, `+col+`, currency,
-			COALESCE(SUM(cost), 0),
+			COALESCE(SUM(cost) FILTER (WHERE NOT notional), 0),
+			COALESCE(SUM(cost) FILTER (WHERE notional), 0),
 			COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
 			COUNT(*), COUNT(*) FILTER (WHERE status = 'error'),
 			COALESCE(SUM(input_tokens) FILTER (WHERE cost IS NULL), 0),
@@ -145,7 +155,7 @@ func (a *Aggregator) Series(ctx context.Context, from, to time.Time, bucket, gro
 	out := []SeriesPoint{}
 	for rows.Next() {
 		var p SeriesPoint
-		if err := rows.Scan(&p.Bucket, &p.Group, &p.Currency, &p.Cost,
+		if err := rows.Scan(&p.Bucket, &p.Group, &p.Currency, &p.Cost, &p.NotionalCost,
 			&p.InputTokens, &p.OutputTokens, &p.Requests, &p.Errors,
 			&p.UnpricedInputTokens, &p.UnpricedOutputTokens); err != nil {
 			return nil, fmt.Errorf("usage series: %w", err)
@@ -172,7 +182,9 @@ type GroupTotal struct {
 
 // Totals returns one row per group (and currency) summed over the
 // whole range — Series without the time bucket, for tables/rankings
-// rather than time-series charts.
+// rather than time-series charts. Cost excludes notional rows (FILTER
+// (WHERE NOT notional), same as Summary/Series) so a group's ranking
+// reflects real spend only.
 func (a *Aggregator) Totals(ctx context.Context, from, to time.Time, groupBy string) ([]GroupTotal, error) {
 	col, ok := groups[groupBy]
 	if !ok {
@@ -183,7 +195,7 @@ func (a *Aggregator) Totals(ctx context.Context, from, to time.Time, groupBy str
 		return nil, fmt.Errorf("usage totals: %w", err)
 	}
 	rows, err := db.Query(ctx, `SELECT `+col+`, currency,
-			COALESCE(SUM(cost), 0),
+			COALESCE(SUM(cost) FILTER (WHERE NOT notional), 0),
 			COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
 			COUNT(*),
 			COALESCE(SUM(input_tokens) FILTER (WHERE cost IS NULL), 0),
@@ -213,24 +225,39 @@ func (a *Aggregator) Totals(ctx context.Context, from, to time.Time, groupBy str
 // out per currency (CostByCurrency) rather than summed into one
 // number: a mission that switched providers mid-run can carry spend in
 // more than one billing currency, and this package never sums across
-// currencies.
+// currencies. CostByCurrency is billed spend only (notional excluded)
+// and equals BilledBrainByCurrency + BilledHarnessByCurrency;
+// NotionalCostByCurrency holds the API-equivalent price of rows billed
+// through a subscription/oauth_token instead (D-051's delegated CLI
+// executor) — a mission's true bill is CostByCurrency alone.
+// BilledHarnessByCurrency is the delegated CLI executor's own billed
+// rows (purpose='executor'); BilledBrainByCurrency is every other
+// billed turn the missions engine ran (explore/plan/worker/review).
 type MissionUsage struct {
-	MissionID        string             `json:"mission_id"`
-	CostByCurrency   map[string]float64 `json:"cost_by_currency"`
-	InputTokens      int64              `json:"input_tokens"`
-	OutputTokens     int64              `json:"output_tokens"`
-	Requests         int64              `json:"requests"`
-	UnpricedRequests int64              `json:"unpriced_requests"`
-	Models           []ModelUsed        `json:"models"`
+	MissionID               string             `json:"mission_id"`
+	CostByCurrency          map[string]float64 `json:"cost_by_currency"`
+	BilledBrainByCurrency   map[string]float64 `json:"billed_brain_by_currency"`
+	BilledHarnessByCurrency map[string]float64 `json:"billed_harness_by_currency"`
+	NotionalCostByCurrency  map[string]float64 `json:"notional_cost_by_currency"`
+	InputTokens             int64              `json:"input_tokens"`
+	OutputTokens            int64              `json:"output_tokens"`
+	Requests                int64              `json:"requests"`
+	UnpricedRequests        int64              `json:"unpriced_requests"`
+	Models                  []ModelUsed        `json:"models"`
 }
 
-// ModelUsed is one provider/model pair actually invoked for a mission
-// — a route is a named fallback chain, not a single model, so this is
-// the only honest answer to "which model ran this," and it can be
-// more than one entry if the chain fell back mid-mission.
+// ModelUsed is one provider/model/harness-ness triple actually invoked
+// for a mission — a route is a named fallback chain, not a single
+// model, so this is the only honest answer to "which model ran this,"
+// and it can be more than one entry if the chain fell back mid-mission.
+// Harness is true when the group's rows are the delegated CLI
+// executor's own (purpose='executor', D-051) rather than the missions
+// engine's direct calls — a model used by both sides yields two rows,
+// so callers can tell the harness's model apart from brain's.
 type ModelUsed struct {
 	Provider string    `json:"provider"`
 	Model    string    `json:"model"`
+	Harness  bool      `json:"harness"`
 	Requests int64     `json:"requests"`
 	LastUsed time.Time `json:"last_used"`
 }
@@ -240,7 +267,13 @@ func (a *Aggregator) Mission(ctx context.Context, missionID string) (MissionUsag
 	if err != nil {
 		return MissionUsage{}, fmt.Errorf("usage mission: %w", err)
 	}
-	m := MissionUsage{MissionID: missionID, CostByCurrency: map[string]float64{}}
+	m := MissionUsage{
+		MissionID:               missionID,
+		CostByCurrency:          map[string]float64{},
+		BilledBrainByCurrency:   map[string]float64{},
+		BilledHarnessByCurrency: map[string]float64{},
+		NotionalCostByCurrency:  map[string]float64{},
+	}
 	err = db.QueryRow(ctx, `SELECT
 			COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
 			COUNT(*), COUNT(*) FILTER (WHERE cost IS NULL)
@@ -250,7 +283,14 @@ func (a *Aggregator) Mission(ctx context.Context, missionID string) (MissionUsag
 	if err != nil {
 		return MissionUsage{}, fmt.Errorf("usage mission: %w", err)
 	}
-	costRows, err := db.Query(ctx, `SELECT currency, COALESCE(SUM(cost), 0)
+	// brain = every billed turn the missions engine ran directly
+	// (explore/plan/worker/review); harness = the delegated CLI
+	// executor's own billed rows (purpose='executor', D-051).
+	costRows, err := db.Query(ctx, `SELECT currency,
+			COALESCE(SUM(cost) FILTER (WHERE NOT notional), 0),
+			COALESCE(SUM(cost) FILTER (WHERE NOT notional AND purpose = 'executor'), 0),
+			COALESCE(SUM(cost) FILTER (WHERE NOT notional AND purpose IS DISTINCT FROM 'executor'), 0),
+			COALESCE(SUM(cost) FILTER (WHERE notional), 0)
 		FROM cost_ledger
 		WHERE mission_id = $1 AND `+notTest+`
 		GROUP BY currency`, missionID)
@@ -259,12 +299,23 @@ func (a *Aggregator) Mission(ctx context.Context, missionID string) (MissionUsag
 	}
 	for costRows.Next() {
 		var currency string
-		var cost float64
-		if err := costRows.Scan(&currency, &cost); err != nil {
+		var billed, harness, brain, notional float64
+		if err := costRows.Scan(&currency, &billed, &harness, &brain, &notional); err != nil {
 			costRows.Close()
 			return MissionUsage{}, fmt.Errorf("usage mission: cost by currency: %w", err)
 		}
-		m.CostByCurrency[currency] = cost
+		if billed != 0 {
+			m.CostByCurrency[currency] = billed
+		}
+		if brain != 0 {
+			m.BilledBrainByCurrency[currency] = brain
+		}
+		if harness != 0 {
+			m.BilledHarnessByCurrency[currency] = harness
+		}
+		if notional != 0 {
+			m.NotionalCostByCurrency[currency] = notional
+		}
 	}
 	if err := costRows.Err(); err != nil {
 		costRows.Close()
@@ -280,10 +331,10 @@ func (a *Aggregator) Mission(ctx context.Context, missionID string) (MissionUsag
 }
 
 func (a *Aggregator) missionModels(ctx context.Context, db *pgxpool.Pool, missionID string) ([]ModelUsed, error) {
-	rows, err := db.Query(ctx, `SELECT provider, model, COUNT(*), MAX(ts)
+	rows, err := db.Query(ctx, `SELECT provider, model, purpose IS NOT DISTINCT FROM 'executor' AS harness, COUNT(*), MAX(ts)
 		FROM cost_ledger
 		WHERE mission_id = $1 AND `+notTest+`
-		GROUP BY provider, model ORDER BY MAX(ts) DESC`, missionID)
+		GROUP BY provider, model, harness ORDER BY MAX(ts) DESC`, missionID)
 	if err != nil {
 		return nil, fmt.Errorf("usage mission: models: %w", err)
 	}
@@ -292,7 +343,7 @@ func (a *Aggregator) missionModels(ctx context.Context, db *pgxpool.Pool, missio
 	out := []ModelUsed{}
 	for rows.Next() {
 		var mu ModelUsed
-		if err := rows.Scan(&mu.Provider, &mu.Model, &mu.Requests, &mu.LastUsed); err != nil {
+		if err := rows.Scan(&mu.Provider, &mu.Model, &mu.Harness, &mu.Requests, &mu.LastUsed); err != nil {
 			return nil, fmt.Errorf("usage mission: models: %w", err)
 		}
 		out = append(out, mu)
@@ -312,6 +363,10 @@ type SessionUsage struct {
 	Requests     int64   `json:"requests"`
 }
 
+// TopSessions ranks sessions by real spend only — Cost excludes
+// notional rows (FILTER (WHERE NOT notional), same as
+// Summary/Series/Totals), so a subscription-billed executor run never
+// inflates a session into the top-spend table.
 func (a *Aggregator) TopSessions(ctx context.Context, from, to time.Time, limit int) ([]SessionUsage, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 10
@@ -321,7 +376,7 @@ func (a *Aggregator) TopSessions(ctx context.Context, from, to time.Time, limit 
 		return nil, fmt.Errorf("usage sessions: %w", err)
 	}
 	rows, err := db.Query(ctx, `SELECT session_id, currency,
-			COALESCE(SUM(cost), 0),
+			COALESCE(SUM(cost) FILTER (WHERE NOT notional), 0),
 			COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COUNT(*)
 		FROM cost_ledger
 		WHERE ts >= $1 AND ts < $2 AND session_id IS NOT NULL AND `+notTest+`

@@ -252,6 +252,10 @@ export interface ConvertedMoney {
 export interface UsageSummary extends ConvertedMoney {
   currency: string
   cost: number
+  // notional_cost is the metered-price equivalent of spend billed
+  // through a subscription/oauth_token executor (D-051) — real spend
+  // was $0, excluded from cost, never folded into it.
+  notional_cost: number
   input_tokens: number
   output_tokens: number
   cache_read_tokens: number
@@ -268,6 +272,8 @@ export interface UsagePoint extends ConvertedMoney {
   group: string
   currency: string
   cost: number
+  // notional_cost mirrors UsageSummary's field — excluded from cost.
+  notional_cost: number
   input_tokens: number
   output_tokens: number
   requests: number
@@ -296,18 +302,37 @@ export interface GroupTotal extends ConvertedMoney {
 export interface ModelUsed {
   provider: string
   model: string
+  // harness is true when this row is the delegated CLI executor's own
+  // calls (purpose='executor', D-051) rather than brain's direct ones —
+  // a model used by both sides yields two separate rows.
+  harness: boolean
   requests: number
   last_used: string
 }
 
 export interface MissionUsage {
   mission_id: string
+  // cost_by_currency is billed spend only — notional (subscription-
+  // billed) rows are excluded, so this is the mission's true bill.
+  // Equals billed_brain_by_currency + billed_harness_by_currency.
   cost_by_currency: Record<string, number>
   // converted_cost_by_currency mirrors cost_by_currency, converted into
   // default_currency, present only when at least one entry had a
   // usable stored fx rate — an entry with no rate is simply omitted,
   // so this map's total can be a floor, not the whole bill.
   converted_cost_by_currency?: Record<string, number>
+  // billed_brain_by_currency/billed_harness_by_currency split billed
+  // spend by who incurred it: the delegated CLI executor's own rows
+  // (harness, D-051) vs everything else the missions engine billed
+  // directly (brain: explore/plan/worker/review).
+  billed_brain_by_currency?: Record<string, number>
+  billed_harness_by_currency?: Record<string, number>
+  // notional_cost_by_currency is the API-equivalent price of rows
+  // billed through a subscription/oauth_token executor (D-051) —
+  // real spend was $0, this is what the same work would have cost
+  // metered.
+  notional_cost_by_currency?: Record<string, number>
+  converted_notional_cost_by_currency?: Record<string, number>
   rate_as_of?: string
   input_tokens: number
   output_tokens: number
@@ -386,7 +411,12 @@ export interface AdminProvider {
   credential_ref: string
   headers: Record<string, string>
   enabled: boolean
-  options?: { reasoning_effort?: string; request_timeout?: string; region?: string }
+  options?: {
+    reasoning_effort?: string
+    request_timeout?: string
+    region?: string
+    anthropic_base_url?: string
+  }
 }
 
 export interface ChainEntry {
@@ -401,6 +431,9 @@ export interface ChainEntry {
 export interface RouteEntryStatus {
   provider_id: string
   provider_name?: string
+  // provider_kind is 'api' | 'cli' — 'cli' rows are mission-only
+  // executor providers (D-051), never built into a chat client.
+  provider_kind?: string
   model: string
   usable: boolean
   skip_reason?: string
@@ -539,6 +572,11 @@ export interface Mission {
   pending_permission_rationale?: string
   last_evidence?: string
   auto_approve_safe: boolean
+  // environment is the sandbox image key (D-05x) this coding mission's
+  // container runs — "" means base, resolved server-side at create
+  // time (explicit request > repo markers > goal keyword > base).
+  // General missions never set this.
+  environment?: string
   schedule_id?: string
   created_at: string
   updated_at: string
@@ -552,6 +590,60 @@ export interface MissionEvent {
   provenance: string
   fingerprint?: string
   created_at: string
+}
+
+// ExecutorUsage is executor.result's token/cost usage block. cost_usd
+// is null when the run authenticated via a subscription or oauth_token
+// (no per-call price) rather than metered API billing — never a
+// guessed 0 (D-013).
+export interface ExecutorUsage {
+  input_tokens: number
+  output_tokens: number
+  cache_read?: number
+  cache_write?: number
+  cost_usd?: number | null
+}
+
+// Payloads for the delegated coding-CLI executor's mission_events
+// (D-051, brain's missions harness). Timeline rendering keys off
+// event.kind, these types just name the shapes for that rendering.
+export interface ExecutorSpawnedPayload {
+  harness: string
+  provider: string
+  model: string
+  auth_mode: string
+  run_id: string
+}
+
+export interface ExecutorProgressPayload {
+  run_id: string
+  byte_offset: number
+  turns: number
+  tool_calls: number
+}
+
+export interface ExecutorResultPayload {
+  status: string
+  is_error: boolean
+  duration_ms: number
+  exit_code: number
+  parse: string
+  denials: string[]
+  usage: ExecutorUsage
+}
+
+export interface ExecutorDiedPayload {
+  reason: string
+  exit_code?: number
+  stderr_tail?: string
+}
+
+export interface ExecutorIdleKilledPayload {
+  idle_s: number
+}
+
+export interface ExecutorAuthFailedPayload {
+  harness: string
 }
 
 // MissionFile is one entry of a mission workspace's file listing
@@ -602,6 +694,8 @@ export interface MissionTemplate {
   budget_amount?: number
   budget_currency?: string
   auto_approve_safe?: boolean
+  harness?: string
+  environment?: string
 }
 
 // Schedule is a recurring cron trigger that fires mission_template

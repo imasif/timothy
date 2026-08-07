@@ -63,13 +63,34 @@ type ProviderRow struct {
 	// region, overridden per-key by the secret JSON's own "region" field
 	// (D-047) when set. Ignored by every other driver.
 	Region string
+	// AnthropicBaseURL comes from options.anthropic_base_url (D-051) — the
+	// URL a claude-cli harness entry injects into the spawned CLI's
+	// environment when this row's own driver isn't already "anthropic"
+	// (e.g. a subscription-auth row with no chat driver at all). Ignored
+	// by every chat-serving driver.
+	AnthropicBaseURL string
 }
 
-// ChainEntry is one step of a route chain.
+// ChainEntry is one step of a route chain. Harness selection moved to
+// the mission itself (D-051 rework): a chain entry is pure
+// {provider_id, model} again, model routing only.
 type ChainEntry struct {
 	ProviderID string `json:"provider_id"`
 	Model      string `json:"model"`
 }
+
+// KnownHarnesses is the single source of truth for valid harness names —
+// the resolve endpoint's executor gate (ResolveRoute) rejects anything
+// else as "unknown harness" (D-051). Adapters that actually spawn these
+// CLIs live in brain (internal/brain/missions/executor); the gateway
+// only validates names and wire-format compatibility, never runs a
+// subprocess itself.
+var KnownHarnesses = map[string]bool{"claude-cli": true}
+
+// harnessWireFormat names the wire protocol each known harness requires
+// from its provider row — checked by both admin validation and the
+// resolve endpoint's executor gate so the two can never disagree.
+var harnessWireFormat = map[string]string{"claude-cli": "anthropic"}
 
 // RouteRow mirrors one routes table row. Strategy picks the chain
 // order at resolve time: "ordered" keeps the written priority; "auto",
@@ -193,6 +214,16 @@ func BuildSnapshot(provRows []ProviderRow, routeRows []RouteRow, lookup func(str
 			s.unhealthy[row.Name] = fmt.Sprintf("credential %s unresolved", row.CredentialRef)
 		default:
 			s.healthy[row.Name] = true
+		}
+
+		// kind='cli' rows (D-051) are mission-only executor providers —
+		// e.g. a subscription-auth claude-cli row with no chat driver at
+		// all. They never serve chat, so no chat provider is built and an
+		// unbuildable/unknown driver name here must never degrade the
+		// snapshot or emit a BuildWarning; executorUsable judges these
+		// rows entirely from the row itself, never from the registry.
+		if row.Kind == "cli" {
+			continue
 		}
 
 		// Built one provider at a time: a single bad driver name or
@@ -384,6 +415,7 @@ var strategyWeights = map[string]struct{ price, latency, tps float64 }{
 type ResolvedEntry struct {
 	Entry         ChainEntry
 	ProviderName  string // empty when the provider id is unknown
+	ProviderKind  string // "api" or "cli"; empty when the provider id is unknown
 	Model         string // entry model, defaulted to the provider's default when empty
 	Usable        bool
 	SkipReason    string  // empty when usable; NoRouteError wording without the source suffix
@@ -424,6 +456,7 @@ func (s *Snapshot) ResolveDetail(route string) []ResolvedEntry {
 			continue
 		}
 		d.ProviderName = row.Name
+		d.ProviderKind = row.Kind
 		if d.Model == "" {
 			d.Model = row.DefaultModel
 		}
@@ -502,6 +535,111 @@ func (s *Snapshot) orderedChain(route string) []ChainEntry {
 		out[i] = d.Entry
 	}
 	return out
+}
+
+// ResolvedRouteEntry is one chain entry as reported by the resolve
+// endpoint (D-051). CredentialRef is always a NAME, never resolved to a
+// secret value.
+type ResolvedRouteEntry struct {
+	ProviderID    string
+	ProviderName  string
+	Driver        string
+	Kind          string
+	Model         string
+	CredentialRef string
+	BaseURL       string
+	Usable        bool
+	SkipReason    string
+}
+
+// ResolveRoute returns route's chain in stored order, annotated with
+// the gate appropriate to the requested axis (D-051 rework — harness is
+// now a caller-supplied param, not a per-entry chain field): harness ==
+// "" evaluates every entry with the chat entryGate (the same verdict
+// ResolveDetail computes); harness != "" evaluates every entry with
+// executorUsable instead, since the chat gate would reject a
+// mission-only executor dispatch unconditionally, and applies the
+// anthropic_base_url override for a non-anthropic driver row. ok is
+// false when the route doesn't exist (disabled or unknown name) OR
+// harness is non-empty and unknown — an existing route with zero
+// entries still returns ok true and an empty slice.
+func (s *Snapshot) ResolveRoute(route, harness string) ([]ResolvedRouteEntry, bool) {
+	chain, ok := s.routes[route]
+	if !ok {
+		return nil, false
+	}
+	if harness != "" && !KnownHarnesses[harness] {
+		return nil, false
+	}
+	required := []provider.Capability{s.requiredCapability(route)}
+	out := make([]ResolvedRouteEntry, 0, len(chain))
+	for _, e := range chain {
+		re := ResolvedRouteEntry{ProviderID: e.ProviderID, Model: e.Model}
+		row, found := s.rows[e.ProviderID]
+		if !found {
+			re.SkipReason = "unknown provider id"
+			out = append(out, re)
+			continue
+		}
+		re.ProviderName, re.Driver, re.Kind, re.CredentialRef = row.Name, row.Driver, row.Kind, row.CredentialRef
+		if re.Model == "" {
+			re.Model = row.DefaultModel
+		}
+		re.BaseURL = row.BaseURL
+		if harness == "" {
+			if _, _, reason := s.entryGate(row, re.Model, required); reason != "" {
+				re.SkipReason = reason
+			} else {
+				re.Usable = true
+			}
+		} else {
+			// The anthropic_base_url override only applies to a kind='api'
+			// row pointed at a third-party anthropic-compatible endpoint —
+			// a kind='cli' row (subscription/oauth-auth) talks to the
+			// vendor's own default endpoint and must keep BaseURL empty, or
+			// BuildInvocation's AuthSubscription/AuthOAuthToken checks
+			// reject the spawn outright (they require no BaseURL at all).
+			if row.Kind != "cli" && row.Driver != "anthropic" && row.AnthropicBaseURL != "" {
+				re.BaseURL = row.AnthropicBaseURL
+			}
+			re.Usable, re.SkipReason = executorUsable(row, harness)
+		}
+		out = append(out, re)
+	}
+	return out, true
+}
+
+// executorUsable applies the harness-entry rule (D-051), deliberately
+// separate from entryGate: a harness entry is dispatched by brain's
+// missions harness as a CLI subprocess, never streamed through this
+// gateway's chat path, so none of entryGate's chat-serving checks
+// (registry membership, chat capability) apply. Usable requires the
+// provider row enabled, a recognized harness name, wire-format
+// compatibility for that harness, and a non-empty credential_ref name
+// (the value itself is never resolved here — ref only, D-051). A
+// kind='cli' row is inherently wire-compatible: it spawns the harness's
+// own CLI talking to the vendor's own default endpoint under
+// subscription/oauth credentials, never a third-party anthropic-
+// compatible one, so the wire check only applies to kind='api' rows
+// (a chat-serving row repurposed as an executor entry).
+func executorUsable(row ProviderRow, harness string) (bool, string) {
+	if !row.Enabled {
+		return false, "disabled"
+	}
+	if !KnownHarnesses[harness] {
+		return false, "unknown harness"
+	}
+	if row.Kind != "cli" {
+		wantWire := harnessWireFormat[harness]
+		wireOK := row.Driver == wantWire || (harness == "claude-cli" && row.AnthropicBaseURL != "")
+		if !wireOK {
+			return false, fmt.Sprintf("wire-incompatible: %s requires %s wire format", harness, wantWire)
+		}
+	}
+	if row.CredentialRef == "" {
+		return false, "credential_ref is required"
+	}
+	return true, ""
 }
 
 // attemptCapable gates one provider+model candidate on the required

@@ -6,7 +6,7 @@ import type { AdminProvider } from '../../api/types'
 export interface ProviderPreset {
   id: string
   name: string
-  driver: 'openaicompat' | 'anthropic' | 'bedrock'
+  driver: 'openaicompat' | 'anthropic' | 'bedrock' | 'claude-cli'
   description: string
   // Sprite symbol in ProviderLogo; custom endpoints render a glyph.
   logo?: string
@@ -190,6 +190,11 @@ export const providerPresets: ProviderPreset[] = [
 // host, then the custom fallback.
 export function matchPreset(p: AdminProvider): ProviderPreset {
   const custom = providerPresets.find((x) => x.id === 'custom')!
+  // kind='cli' rows (driver=claude-cli, D-051) are Anthropic subscription
+  // auth, not a separate preset — branding folds into the Anthropic card.
+  if (p.kind === 'cli') {
+    return providerPresets.find((x) => x.id === 'anthropic') ?? custom
+  }
   if (p.driver === 'anthropic' || p.driver === 'bedrock') {
     return providerPresets.find((x) => x.driver === p.driver) ?? custom
   }

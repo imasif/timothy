@@ -9,7 +9,7 @@ GO_RUN := docker run --rm -v $(CURDIR):/src -w /src \
 	-e GOFLAGS=-buildvcs=false $(GO_IMAGE)
 
 .PHONY: build test test-integration test-live vet lint tidy skills-validate up down logs \
-	brain gateway memoryd web markitdown sandboxd dev canary canary-coding sandbox-image
+	brain gateway memoryd web markitdown sandboxd dev canary canary-coding canary-executor sandbox-image
 
 build:
 	$(GO_RUN) go build ./...
@@ -99,10 +99,28 @@ canary:
 canary-coding:
 	./scripts/canary-coding.sh
 
-# Builds the per-mission sandbox image (python3/node/git/bash — see
-# deploy/sandbox.Dockerfile). Not a compose service: sandboxes are
-# containers brain creates dynamically via the Docker Go SDK, not
-# something `docker compose up` runs on its own. Required before
-# running any mission.
+# Regression gate for the delegated-executor (D-052) path: pins a
+# canary-executor route to a single claude-cli chain entry, no
+# fallback, so a broken executor fails loudly instead of silently
+# passing via native failover. Needs the stack up, a wire-compatible
+# provider configured (driver=anthropic or options.anthropic_base_url),
+# and the sandbox image built with the claude CLI (`make sandbox-image`).
+canary-executor:
+	./scripts/canary-executor.sh
+
+# Builds the per-mission sandbox images: the base (python3/node/git/
+# bash — deploy/sandbox-base.Dockerfile) plus one variant per
+# "environment" (D-05x, sandboxd's image allowlist) FROM that base.
+# Not a compose service: sandboxes are containers brain creates
+# dynamically via the Docker Go SDK, not something `docker compose up`
+# runs on its own. Required before running any mission. timothy-sandbox
+# is tagged as an alias of the base image for back-compat with existing
+# canary scripts/compose references that predate the environment axis.
 sandbox-image:
-	docker build -f deploy/sandbox.Dockerfile -t timothy-sandbox:latest .
+	docker build -f deploy/sandbox-base.Dockerfile -t timothy-sandbox-base:latest .
+	docker tag timothy-sandbox-base:latest timothy-sandbox:latest
+	docker build -f deploy/sandbox-go.Dockerfile -t timothy-sandbox-go:latest .
+	docker build -f deploy/sandbox-node.Dockerfile -t timothy-sandbox-node:latest .
+	docker build -f deploy/sandbox-python.Dockerfile -t timothy-sandbox-python:latest .
+	docker build -f deploy/sandbox-java.Dockerfile -t timothy-sandbox-java:latest .
+	docker build -f deploy/sandbox-php.Dockerfile -t timothy-sandbox-php:latest .

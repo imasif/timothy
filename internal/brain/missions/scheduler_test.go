@@ -94,10 +94,13 @@ func TestResolveTemplateDefaults(t *testing.T) {
 		name        string
 		template    MissionTemplate
 		resolve     AgentResolver
+		routeExists func(context.Context, string) bool
+		codingExec  func(context.Context) string
 		wantRoute   string
 		wantReview  string
 		wantBudget  *float64
 		wantOverlay string
+		wantHarness string
 	}{
 		{
 			name:       "nil resolver falls back to the default role's route",
@@ -105,6 +108,33 @@ func TestResolveTemplateDefaults(t *testing.T) {
 			resolve:    nil,
 			wantRoute:  "default",
 			wantReview: "default",
+		},
+		{
+			name:        "coding template with no harness applies the settings default",
+			template:    MissionTemplate{Goal: "g", Kind: "coding", AgentID: "a1"},
+			resolve:     nil,
+			codingExec:  func(context.Context) string { return "claude-cli" },
+			wantRoute:   "default",
+			wantReview:  "default",
+			wantHarness: "claude-cli",
+		},
+		{
+			name:        "coding template's own harness is never overwritten",
+			template:    MissionTemplate{Goal: "g", Kind: "coding", AgentID: "a1", Harness: "claude-cli"},
+			resolve:     nil,
+			codingExec:  func(context.Context) string { return "" },
+			wantRoute:   "default",
+			wantReview:  "default",
+			wantHarness: "claude-cli",
+		},
+		{
+			name:        "general template never applies the coding executor default",
+			template:    MissionTemplate{Goal: "g", Kind: "general", AgentID: "a1"},
+			resolve:     nil,
+			codingExec:  func(context.Context) string { return "claude-cli" },
+			wantRoute:   "default",
+			wantReview:  "default",
+			wantHarness: "",
 		},
 		{
 			name:     "unresolved agent id falls back to the default role's route",
@@ -136,12 +166,46 @@ func TestResolveTemplateDefaults(t *testing.T) {
 			wantReview:  "explicit-review",
 			wantOverlay: "overlay text",
 		},
+		{
+			name:        "coding template with no route prefers the coding route when it exists",
+			template:    MissionTemplate{Goal: "g", Kind: "coding", AgentID: "a1"},
+			resolve:     nil,
+			routeExists: func(context.Context, string) bool { return true },
+			wantRoute:   "coding",
+			wantReview:  "default",
+		},
+		{
+			name:        "coding template with no route falls back to default when coding route is absent",
+			template:    MissionTemplate{Goal: "g", Kind: "coding", AgentID: "a1"},
+			resolve:     nil,
+			routeExists: func(context.Context, string) bool { return false },
+			wantRoute:   "default",
+			wantReview:  "default",
+		},
+		{
+			name:        "coding template's own route is never overwritten by the coding preference",
+			template:    MissionTemplate{Goal: "g", Kind: "coding", AgentID: "a1", Route: "explicit"},
+			resolve:     nil,
+			routeExists: func(context.Context, string) bool { return true },
+			wantRoute:   "explicit",
+			wantReview:  "default",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			routeForRole := func(context.Context, string) string { return "default" }
-			got, overlay := resolveTemplateDefaults(context.Background(), tc.template, tc.resolve, routeForRole)
+			routeExists := tc.routeExists
+			if tc.template.Kind != "coding" {
+				// A general template must never even consult the coding
+				// preference — proven by a routeExists that panics if
+				// called, not just by asserting the resulting route.
+				routeExists = func(context.Context, string) bool {
+					t.Fatal("routeExists must not be called for a non-coding template")
+					return false
+				}
+			}
+			got, overlay := resolveTemplateDefaults(context.Background(), tc.template, tc.resolve, routeForRole, routeExists, tc.codingExec)
 			if got.Route != tc.wantRoute {
 				t.Errorf("Route = %q, want %q", got.Route, tc.wantRoute)
 			}
@@ -155,6 +219,9 @@ func TestResolveTemplateDefaults(t *testing.T) {
 			}
 			if overlay != tc.wantOverlay {
 				t.Errorf("overlay = %q, want %q", overlay, tc.wantOverlay)
+			}
+			if got.Harness != tc.wantHarness {
+				t.Errorf("Harness = %q, want %q", got.Harness, tc.wantHarness)
 			}
 		})
 	}

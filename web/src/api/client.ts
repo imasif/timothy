@@ -851,6 +851,35 @@ export interface CreateMissionInput {
   budget_amount?: number
   budget_currency?: string
   auto_approve_safe?: boolean
+  // harness names the delegated coding-CLI executor a coding mission
+  // runs under — omit (or "") to apply the settings default,
+  // "native" to force the built-in agent loop. Only valid when
+  // kind === 'coding'.
+  harness?: string
+  // environment selects the sandbox image key (D-05x) a coding
+  // mission's container runs — omit (or "") to auto-detect (repo
+  // markers, then a goal-keyword heuristic, falling back to base).
+  // Only valid when kind === 'coding'.
+  environment?: string
+}
+
+// ExecutorOption is one registered harness's usability on a given
+// route (GET /v1/missions/executor-options) — usable ones carry the
+// provider/model they'd resolve to, unusable ones a reason why not.
+export interface ExecutorOption {
+  harness: string
+  usable: boolean
+  provider_name?: string
+  model?: string
+  reason?: string
+}
+
+export async function getMissionExecutorOptions(route?: string): Promise<ExecutorOption[]> {
+  const qs = route ? `?route=${encodeURIComponent(route)}` : ''
+  const { options } = await request<{ options: ExecutorOption[] }>(
+    `/v1/missions/executor-options${qs}`,
+  )
+  return options ?? []
 }
 
 // listMissions returns every mission by default; opts narrows to one
@@ -868,8 +897,11 @@ export async function listMissions(opts?: {
   return missions ?? []
 }
 
-export async function createMission(input: CreateMissionInput): Promise<{ id: string }> {
-  return request<{ id: string }>('/v1/missions', {
+// createMission returns the full created mission (not just its id) so
+// a server-resolved field decided at create time — e.g. auto-detected
+// environment (D-05x) — is available without a follow-up GET.
+export async function createMission(input: CreateMissionInput): Promise<Mission> {
+  return request<Mission>('/v1/missions', {
     method: 'POST',
     body: JSON.stringify(input),
   })

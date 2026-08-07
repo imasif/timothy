@@ -150,3 +150,127 @@ describe('ProviderAdd bedrock credential inputs', () => {
     expect(screen.queryByPlaceholderText('AKIA…')).not.toBeInTheDocument()
   })
 })
+
+describe('ProviderAdd anthropic auth folding', () => {
+  beforeEach(() => {
+    vi.mocked(validateProvider).mockResolvedValue({ ok: true, latency_ms: 12, model: 'claude-haiku-4-5' })
+    vi.mocked(setSecret).mockResolvedValue()
+    vi.mocked(createProvider).mockResolvedValue('p-anthropic')
+  })
+
+  it('defaults to API key mode with the unchanged api flow', async () => {
+    renderPage('anthropic')
+
+    expect(await screen.findByPlaceholderText('sk-ant-…')).toBeInTheDocument()
+    expect(screen.queryByText('CLI providers have no connection test.')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Test connection' })).toBeInTheDocument()
+
+    fireEvent.change(screen.getByPlaceholderText('sk-ant-…'), { target: { value: 'sk-ant-api03-metered' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Test connection' }))
+
+    await waitFor(() => expect(setSecret).toHaveBeenCalledWith(expect.any(String), 'sk-ant-api03-metered'))
+    await screen.findByText(/^OK,/)
+    fireEvent.click(screen.getByRole('button', { name: 'Add provider' }))
+
+    await waitFor(() => expect(createProvider).toHaveBeenCalled())
+    const call = vi.mocked(createProvider).mock.calls[0][0]
+    expect(call).toMatchObject({ kind: 'api', driver: 'anthropic' })
+  })
+
+  it('rejects a subscription token pasted into the API key mode', async () => {
+    renderPage('anthropic')
+
+    fireEvent.change(await screen.findByPlaceholderText('sk-ant-…'), {
+      target: { value: 'sk-ant-oat01-realtoken' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Test connection' }))
+
+    expect(await screen.findByText(/use "Subscription token" instead/)).toBeInTheDocument()
+    expect(validateProvider).not.toHaveBeenCalled()
+  })
+
+  it('switching to subscription token mode skips the connection probe entirely', async () => {
+    renderPage('anthropic')
+
+    fireEvent.click(screen.getByRole('combobox'))
+    fireEvent.click(await screen.findByText('Subscription token'))
+
+    await screen.findByText('CLI providers have no connection test.')
+    expect(screen.queryByRole('button', { name: 'Test connection' })).not.toBeInTheDocument()
+    expect(validateProvider).not.toHaveBeenCalled()
+  })
+
+  it('accepts a subscription token and rejects anything else', async () => {
+    renderPage('anthropic')
+
+    fireEvent.click(screen.getByRole('combobox'))
+    fireEvent.click(await screen.findByText('Subscription token'))
+
+    fireEvent.change(await screen.findByPlaceholderText('sk-ant-oat…'), {
+      target: { value: 'sk-ant-api03-notatoken' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Add provider' }))
+
+    expect(
+      await screen.findByText(/Subscription tokens start with sk-ant-oat/),
+    ).toBeInTheDocument()
+    expect(createProvider).not.toHaveBeenCalled()
+
+    fireEvent.change(screen.getByPlaceholderText('sk-ant-oat…'), {
+      target: { value: 'sk-ant-oat01-realtoken' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Add provider' }))
+
+    await waitFor(() => expect(createProvider).toHaveBeenCalled())
+    expect(setSecret).toHaveBeenCalledWith(expect.any(String), 'sk-ant-oat01-realtoken')
+    const call = vi.mocked(createProvider).mock.calls[0][0]
+    expect(call).toMatchObject({ kind: 'cli', driver: 'claude-cli' })
+  })
+
+  it('prefills a default model for subscription token mode and sends it in the payload', async () => {
+    renderPage('anthropic')
+
+    fireEvent.click(screen.getByRole('combobox'))
+    fireEvent.click(await screen.findByText('Subscription token'))
+
+    expect(await screen.findByPlaceholderText('claude-sonnet-4-6')).toHaveValue('claude-sonnet-4-6')
+
+    fireEvent.change(screen.getByPlaceholderText('sk-ant-oat…'), {
+      target: { value: 'sk-ant-oat01-realtoken' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Add provider' }))
+
+    await waitFor(() => expect(createProvider).toHaveBeenCalled())
+    const call = vi.mocked(createProvider).mock.calls[0][0]
+    expect(call).toMatchObject({ kind: 'cli', driver: 'claude-cli', default_model: 'claude-sonnet-4-6' })
+  })
+
+  it('sends an edited default model for subscription token mode', async () => {
+    renderPage('anthropic')
+
+    fireEvent.click(screen.getByRole('combobox'))
+    fireEvent.click(await screen.findByText('Subscription token'))
+
+    fireEvent.change(await screen.findByPlaceholderText('claude-sonnet-4-6'), {
+      target: { value: 'opus' },
+    })
+    fireEvent.change(screen.getByPlaceholderText('sk-ant-oat…'), {
+      target: { value: 'sk-ant-oat01-realtoken' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Add provider' }))
+
+    await waitFor(() => expect(createProvider).toHaveBeenCalled())
+    const call = vi.mocked(createProvider).mock.calls[0][0]
+    expect(call).toMatchObject({ default_model: 'opus' })
+  })
+
+  it('shows setup-token instructions for the subscription token mode', async () => {
+    renderPage('anthropic')
+
+    fireEvent.click(screen.getByRole('combobox'))
+    fireEvent.click(await screen.findByText('Subscription token'))
+
+    expect(await screen.findByText(/claude setup-token/)).toBeInTheDocument()
+    expect(screen.getByText(/long-lived/)).toBeInTheDocument()
+  })
+})
