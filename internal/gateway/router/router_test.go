@@ -907,6 +907,30 @@ func TestResolveRouteMixedChainExecutorAxis(t *testing.T) {
 	}
 }
 
+// TestKindCliHealthyMeansCredentialResolves: a kind='cli' row has no
+// chat driver to probe, so Providers()'s healthy map must judge it
+// purely on whether its credential_ref resolves — same rule as an
+// api-kind row, just without ever reaching provider.Build.
+func TestKindCliHealthyMeansCredentialResolves(t *testing.T) {
+	t.Parallel()
+	snap := harnessSnapshot(t)
+
+	_, healthy := snap.Providers()
+	if !healthy["claude-sub"] {
+		t.Fatal("kind='cli' row with a resolving credential_ref reported unhealthy")
+	}
+
+	provRows := []ProviderRow{
+		{ID: "p2", Name: "claude-sub", Kind: "cli", Driver: "claude-cli",
+			CredentialRef: "subscription", Enabled: true},
+	}
+	unresolved, _ := BuildSnapshot(provRows, nil, func(string) string { return "" })
+	_, healthy = unresolved.Providers()
+	if healthy["claude-sub"] {
+		t.Fatal("kind='cli' row with an unresolved credential_ref reported healthy")
+	}
+}
+
 func TestResolveRouteHarnessOnly(t *testing.T) {
 	t.Parallel()
 	provRows := []ProviderRow{
@@ -998,5 +1022,40 @@ func TestResolveRouteUnknownRoute(t *testing.T) {
 	snap := harnessSnapshot(t)
 	if _, ok := snap.ResolveRoute("no-such-route", ""); ok {
 		t.Fatalf("ResolveRoute: want ok=false for unknown route")
+	}
+}
+
+// TestResolveRouteCarriesPrices: a delegated executor caller (brain's
+// missions harness) needs the entry's own configured price row to cost
+// a non-anthropic provider's tokens itself (D-05x) — ResolveRoute must
+// carry it, nil when the model has no price row, never guessed.
+func TestResolveRouteCarriesPrices(t *testing.T) {
+	t.Parallel()
+	provRows := []ProviderRow{
+		{ID: "p1", Name: "glm", Kind: "api", Driver: "openaicompat",
+			CredentialRef: "G_KEY", Enabled: true, AnthropicBaseURL: "http://glm.example",
+			Models: []ModelInfo{
+				{ID: "glm-4.7", Prices: &ModelPrices{InputPerMTok: 1, OutputPerMTok: 2}},
+				{ID: "glm-unpriced"},
+			},
+		},
+	}
+	routeRows := []RouteRow{
+		{Name: "coding", Enabled: true, Chain: []ChainEntry{
+			{ProviderID: "p1", Model: "glm-4.7"},
+			{ProviderID: "p1", Model: "glm-unpriced"},
+		}},
+	}
+	snap, _ := BuildSnapshot(provRows, routeRows, func(string) string { return "sk" })
+
+	entries, ok := snap.ResolveRoute("coding", "claude-cli")
+	if !ok || len(entries) != 2 {
+		t.Fatalf("ResolveRoute = %+v, ok=%v, want 2 entries", entries, ok)
+	}
+	if entries[0].Prices == nil || entries[0].Prices.InputPerMTok != 1 {
+		t.Fatalf("priced entry Prices = %+v, want InputPerMTok 1", entries[0].Prices)
+	}
+	if entries[1].Prices != nil {
+		t.Fatalf("unpriced entry Prices = %+v, want nil", entries[1].Prices)
 	}
 }
