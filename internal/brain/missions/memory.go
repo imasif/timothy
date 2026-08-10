@@ -67,7 +67,7 @@ func (d *Driver) extractMissionMemory(ctx context.Context, id string, terminal P
 	if alreadyExtracted(events) {
 		return
 	}
-	digest := buildDigest(m, events, terminal, failureReason)
+	digest := OutcomeDigest(m, events, terminal, failureReason)
 	// The idempotency record must land BEFORE dispatch, not after: the
 	// extraction call itself is fire-and-forget (no completion signal
 	// this function can wait on), so appending after would leave the
@@ -108,13 +108,15 @@ func (d *Driver) backfillMissionName(ctx context.Context, id string) {
 	}()
 }
 
-// buildDigest assembles the curated extraction input: goal, title,
+// OutcomeDigest assembles the curated extraction input: goal, title,
 // kind, explore notes, per-unit outcomes (title/status/verify evidence
 // summary only, never shell output), the review verdict (or
 // review_skipped), and the terminal state/failure reason. Deliberately
 // excludes anything resembling the raw transcript — build-log noise
 // (tool_execution payloads, mission.turn timings) never appears here.
-func buildDigest(m Mission, events []Event, terminal Phase, failureReason string) string {
+// Serves both memory extraction (above) and a follow-up mission's
+// parent context (api/missions.go's create).
+func OutcomeDigest(m Mission, events []Event, terminal Phase, failureReason string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "mission goal: %s\n", m.Goal)
 	if m.Name != "" {
